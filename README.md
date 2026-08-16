@@ -1,4 +1,6 @@
-# paper2code — "A Programming Paradigm for Spatiotemporal Composability"
+**Agent Harness using deepseek-v4-pro + max thinking.**
+
+# A Programming Paradigm for Spatiotemporal Composability
 
 An executable implementation of Shi, Zhang & Cui's paper (the formal paper
 behind [Cordis](https://github.com/cordiverse/paper)): the spacetime calculus
