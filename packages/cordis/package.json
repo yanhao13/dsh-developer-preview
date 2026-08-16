@@ -1,0 +1,23 @@
+{
+  "name": "spacetime-cordis",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A full framework mirroring Cordis per Section 5 of the paper: context, services, events, fibers, registry, declarative loader with reconciliation and HMR.",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "tsx --test test/**/*.test.ts",
+    "demo": "tsx demo/main.ts"
+  },
+  "dependencies": {
+    "spacetime-calculus": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.22.0",
+    "typescript": "^5.6.0"
+  }
+}
