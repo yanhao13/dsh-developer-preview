@@ -72,10 +72,3 @@ the coarse-grained-workaround contrast, and HMR with rollback.
 - The framework's fiber accumulator closures differ between runs by
   construction (each folds its own inverses), so the confluence check compares
   the paper's ≃ fields (tables, ω, τ, π, θ.kind) rather than closure identity.
-
-## Sources
-
-- The paper: `.workbuddy/paper/paper.pdf` (extracted text `paper.txt`).
-- Section-by-section specifications extracted for this implementation:
-  `.workbuddy/paper/spec-3-effects-coeffects.md`, `spec-4-calculus.md`,
-  `spec-5-implementation.md`.
