@@ -34,4 +34,4 @@ Status: `tsc --noEmit` clean, **16/16 tests passing** (`vitest` + `fast-check` p
 ---
 
 ## License & attribution
-- The [paper](https://github.com/cordiverse/paper/blob/main/paper.pdf) itself is by DeepSeek-AI.
+- The paper itself is by DeepSeek-AI.
