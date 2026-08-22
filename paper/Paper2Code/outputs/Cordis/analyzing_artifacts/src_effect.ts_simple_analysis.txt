@@ -1,0 +1,451 @@
+# Logic Analysis: `src/effect.ts`
+
+## 1. Role of the file
+
+`src/effect.ts` implements **revertible effect tracking**, corresponding to:
+
+- Paper **Algorithm 1** (Effect tracking)
+- Paper **Section 3.1** (`track`, `recover`, `effectΓ`, `𝔈iterΓ`)
+- Paper **Section 5.1.1** (`ctx.effect`)
+- Configuration:
+  - `core.effectTracking.executionModel: async-generator`
+  - `core.effectTracking.inverseComposition: LIFO`
+  - `core.effectTracking.armedGuard: true`
+  - `core.effectTracking.guardCheckPerIteration: true`
+  - `core.effectTracking.disposalIsIdempotent: true`
+
+This file provides the **single mutation primitive** of the framework. All higher-level operations (`ctx.set`, `ctx.use`, component effects) eventually reduce to `EffectEngine.effect(ctx, callback)`.
+
+---
+
+## 2. Imports and dependency direction
+
+`src/effect.ts` depends on:
+
+- `./types` — for `Key`, `Dispose`, `Inverse`, `Guard`, `EffectCallback`, `Context` type reference.
+- `./context` — for the `Context` class.
+
+A circular dependency exists at runtime: `Context` delegates to `EffectEngine`, while `EffectEngine` only needs `Context` as a **type**. Therefore:
+
+```ts
+import type { Context } from './context';
+```
+
+This breaks the runtime cycle while still satisfying the design.
+
+`EffectEngine` should not reach into private `Context` slots (`@@store`, `@@isolate`, `@@intercept`). It only needs the public `ctx.dispose` property.
+
+---
+
+## 3. Public API surface
+
+`EffectEngine` is a class with only static methods:
+
+```ts
+export class EffectEngine {
+  static execute(callback: EffectCallback, guard: Guard): Promise<Dispose>;
+  static effect(ctx: Context, callback: EffectCallback): Dispose;
+  static compose(a: Dispose, b: Dispose): Dispose;
+  static identity(): Dispose;
+}
+```
+
+No other public members are needed.
+
+---
+
+## 4. `identity()`
+
+`identity()` returns a no-op disposer:
+
+```ts
+static identity(): Dispose {
+  return () => {};
+}
+```
+
+It is the initial accumulator in `execute`.
+
+It is also the reset value of `fiber.dispose` after unload.
+
+---
+
+## 5. `compose(a, b)` and the LIFO invariant
+
+This is the most semantically important helper.
+
+### Requirement
+
+Given two disposers `a` and `b`, the returned disposer must preserve **LIFO recovery**:
+
+- If an effect yields inverse `v1`, then later yields inverse `v2`,
+- then running the final composite must run `v2` first, then `v1`.
+
+### Chosen convention
+
+We define:
+
+```ts
+compose(a, b) = async () => {
+  await a();
+  await b();
+};
+```
+
+That is, **`a` runs first**.
+
+This matches the LIFO usage:
+
+```ts
+inverse = compose(value, inverse);
+```
+
+where `value` is the newly yielded inverse and `inverse` is the previously accumulated one.
+
+### Why this order is correct
+
+- First yielded inverse: `inverse = compose(v1, identity)`
+  - runs `v1`
+- Second yielded inverse: `inverse = compose(v2, inverse)`
+  - runs `v2`, then runs the previous composite, which runs `v1`
+
+Result: `v2` before `v1`, i.e., **last-in-first-out**.
+
+### Documenting the convention
+
+The design text says `compose(a, b)` runs `b` before `a`. If that exact convention is kept internally, the call sites must be swapped:
+
+```ts
+inverse = compose(inverse, value);        // runs value first
+ctx.dispose = compose(ctx.dispose, dispose); // runs dispose first
+```
+
+Either implementation is acceptable as long as the **observable LIFO order** is:
+
+> Most recently registered inverse runs first.
+
+The source of truth is the LIFO invariant, not the argument names.
+
+---
+
+## 6. Normalizing an `EffectCallback` to an async iterator
+
+`EffectCallback` is:
+
+```ts
+() => AsyncGenerator<Inverse, void, unknown> | (() => Inverse | void)
+```
+
+`execute` must accept both forms.
+
+### Cases
+
+1. **Async generator returned**
+   - The callback returns an object with `next()`, `return()`, `throw()`.
+   - Use it directly.
+
+2. **Plain disposer function returned**
+   - The callback returns a function `() => void | Promise<void>`.
+   - This is a single inverse.
+   - Wrap it in a one-shot async generator:
+
+```ts
+async function* single(dispose: Dispose) {
+  yield dispose;
+}
+```
+
+3. **`undefined` / `null` returned**
+   - Treat as an effect with no inverses.
+   - Use an empty async generator.
+
+4. **Sync generator returned** *(robustness)*
+   - Not in the type, but can be supported by wrapping `next()` with `Promise.resolve`.
+
+### Important distinction
+
+- A **function** returned from `callback()` is treated as an **inverse/disposer**, not as another callback.
+- An **object with `next`** is treated as an **iterator**.
+
+This distinction matters when normalizing.
+
+---
+
+## 7. `execute(callback, guard)` — detailed algorithm
+
+This is the engine that drives effect iteration.
+
+### Steps
+
+```text
+1. If guard() is false:
+   - return identity()
+   - (Do not call callback() if no iteration should run.)
+
+2. const result = callback()
+
+3. Normalize result to an async iterator.
+
+4. let inverse = identity()
+
+5. while guard() is true:
+   a. const step = await iterator.next()
+   b. if step.done: break
+   c. const value = step.value
+   d. if typeof value === 'function':
+        inverse = compose(value, inverse)
+      else:
+        // ignore non-function yields, or warn in dev mode
+6. return inverse
+```
+
+### Guard semantics
+
+- `guard` is checked **before each iteration**.
+- This includes an initial check before `callback()` is invoked.
+- The purpose is to enable **step-boundary interruption**:
+  - If the target view changes between iterations,
+  - only already-performed effects are kept,
+  - remaining iterations are not executed.
+
+### Why the initial guard check matters
+
+For an async generator callback, calling `callback()` alone does not execute the body; side effects begin on the first `next()`.
+
+For a plain disposer-style callback, side effects happen immediately when `callback()` is invoked. Therefore, checking `guard()` before calling `callback()` prevents applying an effect when the guard is already false.
+
+In the lifecycle use case, this corresponds to `L-Divert` aborting before any new iteration runs.
+
+### Handling yielded inverses
+
+- A yielded `value` is a `Dispose` function.
+- Only functions should be composed.
+- `if (value)` from the paper is replaced by:
+
+```ts
+if (typeof value === 'function') {
+  inverse = compose(value, inverse);
+}
+```
+
+This avoids composing `0`, `''`, `false`, etc.
+
+### Error behavior
+
+- If `callback()` throws, `execute` rejects.
+- If `iterator.next()` rejects, `execute` rejects.
+- No inverse is manufactured for a failed iteration.
+- `execute` does **not** swallow errors.
+- Recovery of already-yielded inverses on failure is the responsibility of the caller (`Lifecycle.reload` / L-Raise path).
+
+---
+
+## 8. `effect(ctx, callback)` — public effect primitive
+
+This wraps `execute` with:
+
+- **armed guard**
+- **idempotent disposal**
+- **parent-context composition**
+
+### Algorithm
+
+```text
+1. let armed = true
+
+2. const task = execute(callback, () => armed)
+
+3. function dispose():
+   a. if not armed: return
+   b. armed = false
+   c. const recover = await task
+   d. await recover()
+   e. ctx.dispose = compose(dispose, ctx.dispose)
+
+4. return dispose
+```
+
+### Idempotency
+
+- `armed` starts `true`.
+- The first call to `dispose()` sets it to `false`.
+- Any later call returns immediately.
+- This satisfies:
+
+```yaml
+disposalIsIdempotent: true
+```
+
+### Interaction with in-flight iteration
+
+Suppose `dispose()` is called while `execute` is awaiting `iterator.next()`.
+
+- `armed` becomes `false`.
+- When the pending `next()` resolves, the loop checks `guard()`.
+- It stops before the next iteration.
+- The inverses already yielded are composed and returned by `task`.
+- `dispose()` then awaits `task` and runs the composite inverse.
+
+This is exactly **partial rollback**:
+
+> A component effect interrupted mid-way is reverted as far as it has already progressed.
+
+### Parent-context registration
+
+After successful recovery:
+
+```ts
+ctx.dispose = compose(dispose, ctx.dispose);
+```
+
+This **prepends** the current effect’s disposer to the parent context accumulator.
+
+Because `compose` runs the first argument first, disposing the parent context will dispose this effect before previously registered effects.
+
+This gives cross-effect LIFO ordering:
+
+- First created effect: registered first.
+- Second created effect: registered before first.
+- Parent disposal runs second’s disposer before first’s.
+
+### When `recover()` throws
+
+- `armed` is already `false`.
+- The error propagates to the caller of `dispose()`.
+- `ctx.dispose` is not extended, matching the paper’s sequential form:
+
+```text
+recover();
+ctx.dispose = dispose ∘ ctx.dispose;
+```
+
+This should be documented as an assumption: inverses are expected to succeed.
+
+---
+
+## 9. Key invariants preserved by this file
+
+### 9.1 LIFO within one effect
+
+Given yielded inverses `v1, v2, ..., vn`, the returned composite performs:
+
+```text
+vn, then v(n-1), ..., then v1
+```
+
+### 9.2 LIFO across effects on one context
+
+When multiple `ctx.effect` disposers are registered on the same `ctx.dispose`, the later-created effect is disposed first.
+
+### 9.3 Guard checked per iteration
+
+The loop cannot advance past an iteration unless the guard is true.
+
+### 9.4 Disposal at most once
+
+The `armed` flag guarantees that an effect’s inverse runs at most once.
+
+### 9.5 No effect leakage
+
+If a callback yields no inverses, `execute` returns `identity()`; disposal still completes safely.
+
+---
+
+## 10. Edge cases and decisions
+
+### 10.1 Callback returns a plain function
+
+```ts
+ctx.effect(() => {
+  // perform side effect
+  return () => { /* undo */ };
+});
+```
+
+In `execute`, the returned function is **not called immediately**. It is yielded as the inverse and will be called when the composite inverse runs.
+
+### 10.2 Callback returns an async generator
+
+```ts
+ctx.effect(async function* () {
+  yield undo1;
+  yield undo2;
+});
+```
+
+`execute` iterates it directly.
+
+### 10.3 Callback returns `undefined`
+
+This can happen if the callback has an early `return`.
+
+`execute` treats it as an empty iterator. No inverse is recorded, but no crash occurs.
+
+### 10.4 Generator completes without yielding
+
+`inverse` remains `identity()`.
+
+### 10.5 Guard becomes false during an awaited `next()`
+
+The yielded value from that completed iteration is still composed, then the loop stops. This is correct: the iteration has already happened, so its inverse must be kept.
+
+### 10.6 Non-function yield
+
+The type says only `Dispose` values are yielded, but defensive code should check `typeof value === 'function'` before composing.
+
+### 10.7 `dispose()` called twice
+
+Second call is a no-op due to `armed === false`.
+
+### 10.8 `dispose()` called before the first `next()` resolves
+
+`armed` is set to `false`; the loop stops after the current or first iteration completes.
+
+---
+
+## 11. Relationship to the lifecycle
+
+Although `src/effect.ts` does not define the fiber lifecycle, it is the engine used by `Lifecycle.reload`:
+
+- `fiber.apply` is an `EffectCallback`.
+- `Lifecycle.reload` calls:
+
+```ts
+EffectEngine.execute(fiber.apply, () => fiber.target === target0)
+```
+
+- The guard is the **target fixity check** from `Theorem 64`.
+- The returned composite inverse is folded into `fiber.dispose`.
+
+Thus this file is responsible for:
+
+- executing component effects,
+- collecting their inverses,
+- enabling interruption at iteration boundaries,
+- providing the raw inverse that unload will apply.
+
+The lifecycle adds:
+
+- committed view management,
+- guarded withdrawal,
+- state transitions.
+
+---
+
+## 12. Summary
+
+`src/effect.ts` is a focused, single-responsibility module:
+
+| Concern | Implementation |
+|---|---|
+| Effect iteration | `execute(callback, guard)` |
+| LIFO inverse accumulation | `inverse = compose(value, inverse)` |
+| Atomic tracked effect | `effect(ctx, callback)` |
+| Idempotent disposal | `armed` flag |
+| Parent-context registration | `ctx.dispose = compose(dispose, ctx.dispose)` |
+| No-op disposer | `identity()` |
+| Composite disposer | `compose(a, b)` |
+
+The central invariant is:
+
+> At every level — inside a single effect and across effects on one context — the most recently registered inverse runs first, and disposal is safe to call at most once.

@@ -1,0 +1,821 @@
+## Code: src/hmr.ts
+```typescript
+/**
+ * src/hmr.ts
+ *
+ * Hot Module Replacement engine.
+ *
+ * This module implements Section 5.2.2 of the paper.  It is the runtime
+ * counterpart of:
+ *
+ * - Algorithm 8 (`classify`)     — module acceptance / decline fixed point;
+ * - Algorithm 9 (`getDependencies`, `detectStale`) — stale entry detection;
+ * - Algorithm 10 (`reload`)      — transactional module reload.
+ *
+ * The HMR engine is deliberately independent of bundler-specific hooks.
+ * Module resolution is performed through the Node.js module system where
+ * possible, and the static import scanner is intentionally conservative:
+ * dynamic, non-literal imports are not followed.
+ *
+ * Configuration keys honoured from `config.yaml`:
+ *
+ * - `hmr.classification.seededWith: stashed`
+ * - `hmr.classification.declinedWith: externals`
+ * - `hmr.classification.acceptRule: any-import-accepted`
+ * - `hmr.classification.declineRule: all-imports-declined`
+ * - `hmr.classification.cycleDefault: declined`
+ * - `hmr.staleDetection.dependencyBoundary: declined`
+ * - `hmr.staleDetection.staleRule: dependency-tree-intersects-accepted`
+ * - `hmr.reload.transactional: true`
+ * - `hmr.reload.cacheBackup: true`
+ * - `hmr.reload.cacheRestoreOnError: true`
+ */
+
+import { builtinModules, createRequire } from 'node:module';
+import * as path from 'node:path';
+import * as fs from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { Loader } from './loader';
+import type {
+  Classification,
+  Component,
+  Context,
+  Fiber,
+  LoadedEntry,
+} from './types';
+
+/* ------------------------------------------------------------------ *
+ * Node module resolution and cache access
+ * ------------------------------------------------------------------ */
+
+/**
+ * A CommonJS `require` function whose cache we can safely mutate.
+ *
+ * `createRequire` returns a function bound to the current working directory.
+ * It is used only for cache invalidation and for resolving bare specifiers.
+ */
+const nodeRequire = createRequire(path.join(process.cwd(), '__cordis_hmr__.cjs'));
+
+/**
+ * The set of Node.js builtin module names.
+ */
+const builtinSet = new Set<string>(builtinModules);
+
+/* ------------------------------------------------------------------ *
+ * Static import scanner helpers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Recognised file-extensions tried when a relative import omits its suffix.
+ */
+const EXTENSION_CANDIDATES = [
+  '.ts',
+  '.tsx',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+  '.json',
+  '.node',
+];
+
+/**
+ * Recognised directory index file names, in resolution priority order.
+ */
+const INDEX_CANDIDATES = [
+  'index.ts',
+  'index.tsx',
+  'index.js',
+  'index.jsx',
+  'index.mjs',
+  'index.cjs',
+  'index.json',
+  'index.node',
+];
+
+/**
+ * Returns `true` when `value` is a regular file.
+ */
+function isFile(value: string): boolean {
+  try {
+    return fs.statSync(value).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns `true` when `value` is a directory.
+ */
+function isDirectory(value: string): boolean {
+  try {
+    return fs.statSync(value).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * HMR engine
+ * ------------------------------------------------------------------ */
+
+/**
+ * A record describing one module's pre-invalidation cache state.
+ *
+ * This is intentionally a plain structural type; the public API of
+ * `invalidateCaches` returns `Map<string, any>` to keep the design of the
+ * paper's Algorithm 10 unchanged while still giving the implementation a
+ * typed internal shape.
+ */
+interface HmrBackupRecord {
+  /** Normalized absolute module identifier. */
+  resolved: string;
+
+  /** The previous CommonJS module object, if any. */
+  cached: any;
+
+  /**
+   * The previous module exports (or the registered Cordis component, when
+   * the entry was provided through `Loader.moduleRegistry`).
+   */
+  exports: any;
+}
+
+/**
+ * Hot module replacement engine.
+ *
+ * Public API:
+ *
+ * - `getImports(url)` — direct static imports of a module;
+ * - `classify(stashed, externals)` — Algorithm 8;
+ * - `getDependencies(root, declined)` — Algorithm 9 dependency traversal;
+ * - `detectStale(entries, accepted, declined)` — Algorithm 9 stale detection;
+ * - `invalidateCaches(accepted)` — backup and clear module caches;
+ * - `restoreCaches(backup)` — restore caches after a failed reload;
+ * - `reload(ctx, accepted, staleEntries)` — Algorithm 10 transactional reload.
+ */
+export class HMR {
+  /**
+   * Cache of parsed import graphs.  Cleared for changed modules before
+   * classification and again during cache invalidation.
+   */
+  private readonly importCache = new Map<string, Set<string>>();
+
+  /* ---------------------------------------------------------------- *
+   * Path and module identity helpers
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Normalizes a module URL / path into a stable canonical identifier.
+   *
+   * Builtins keep their original form (`fs`, `node:path`, ...).  File URLs
+   * are converted to filesystem paths.  Relative paths and bare specifiers
+   * are resolved against the current working directory or Node's resolution
+   * algorithm.  Symlinks are resolved where possible.
+   */
+  private normalizeUrl(url: string): string {
+    if (this.isBuiltin(url)) {
+      return url;
+    }
+
+    let target = url;
+
+    try {
+      if (url.startsWith('file://')) {
+        target = fileURLToPath(url);
+      } else if (!path.isAbsolute(url)) {
+        try {
+          target = nodeRequire.resolve(url, {
+            paths: [process.cwd()],
+          });
+        } catch {
+          target = path.resolve(url);
+        }
+      } else {
+        target = path.resolve(url);
+      }
+    } catch {
+      target = path.resolve(url);
+    }
+
+    target = path.resolve(target);
+
+    try {
+      return fs.realpathSync(target);
+    } catch {
+      return target;
+    }
+  }
+
+  /**
+   * Returns `true` when the module identifier refers to a Node.js builtin.
+   */
+  private isBuiltin(url: string): boolean {
+    if (url.startsWith('node:')) {
+      return true;
+    }
+
+    const base = url.split('/')[0];
+    return builtinSet.has(base);
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Static import graph
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Returns the direct static imports of a module.
+   *
+   * The scanner recognizes, conservatively:
+   *
+   * - `import ... from "spec"`;
+   * - `import "spec"`;
+   * - `export ... from "spec"`;
+   * - `require("spec")`;
+   * - literal `import("spec")`.
+   *
+   * Non-literal dynamic imports and virtual modules are not followed.
+   * Returned identifiers are normalized.
+   */
+  getImports(url: string): Set<string> {
+    const normalized = this.normalizeUrl(url);
+
+    if (this.isBuiltin(normalized)) {
+      return new Set<string>();
+    }
+
+    const cached = this.importCache.get(normalized);
+    if (cached) {
+      return new Set(cached);
+    }
+
+    const source = this.readSource(normalized);
+    if (source === null) {
+      this.importCache.set(normalized, new Set<string>());
+      return new Set<string>();
+    }
+
+    const imports = new Set<string>();
+
+    // import ... from '...' / import '...' / export ... from '...'
+    const staticImportPattern =
+      /\b(?:import|export)\s+(?:[^'"]*?\s+from\s+)?['"]([^'"]+)['"]/g;
+    // require('...')
+    const requirePattern = /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+    // import('...')
+    const dynamicImportPattern = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+
+    this.collectMatches(source, staticImportPattern, imports, normalized);
+    this.collectMatches(source, requirePattern, imports, normalized);
+    this.collectMatches(source, dynamicImportPattern, imports, normalized);
+
+    this.importCache.set(normalized, imports);
+    return new Set(imports);
+  }
+
+  /**
+   * Extracts import specifiers from a source string and resolves them.
+   */
+  private collectMatches(
+    source: string,
+    pattern: RegExp,
+    output: Set<string>,
+    importerPath: string,
+  ): void {
+    let match: RegExpExecArray | null;
+
+    while ((match = pattern.exec(source)) !== null) {
+      const specifier = match[1];
+      const resolved = this.resolveSpecifier(specifier, importerPath);
+      output.add(this.normalizeUrl(resolved));
+    }
+  }
+
+  /**
+   * Reads a module source file, returning `null` when the module is a
+   * builtin, a directory, or a missing file.
+   */
+  private readSource(normalizedUrl: string): string | null {
+    if (this.isBuiltin(normalizedUrl) || isDirectory(normalizedUrl)) {
+      return null;
+    }
+
+    try {
+      return fs.readFileSync(normalizedUrl, 'utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Resolves one import specifier against the importing module's path.
+   *
+   * Relative specifiers are resolved first as files, then through the
+   * configured extension candidates, then as directory `index` files.  Bare
+   * specifiers are handled by Node's resolution algorithm.  Builtins are
+   * returned unchanged.
+   */
+  private resolveSpecifier(specifier: string, importerPath: string): string {
+    if (this.isBuiltin(specifier)) {
+      return specifier;
+    }
+
+    if (
+      specifier.startsWith('./') ||
+      specifier.startsWith('../') ||
+      specifier.startsWith('/')
+    ) {
+      const resolved = path.resolve(path.dirname(importerPath), specifier);
+      return this.resolveAsFileOrDirectory(resolved) ?? this.normalizeUrl(resolved);
+    }
+
+    try {
+      return this.normalizeUrl(
+        nodeRequire.resolve(specifier, {
+          paths: [path.dirname(importerPath)],
+        }),
+      );
+    } catch {
+      // Unresolved bare specifiers are kept as paths so that they are treated
+      // conservatively as declined by `classify`.
+      return this.normalizeUrl(path.resolve(specifier));
+    }
+  }
+
+  /**
+   * Attempts to resolve a path as a file, an extension-suffixed file, or a
+   * directory index file.
+   */
+  private resolveAsFileOrDirectory(candidate: string): string | null {
+    if (isFile(candidate)) {
+      return this.normalizeUrl(candidate);
+    }
+
+    // TypeScript / NodeNext interop: a `.js` specifier may point to a `.ts`
+    // source file in a TS project.
+    if (candidate.endsWith('.js')) {
+      const tsCandidate = `${candidate.slice(0, -3)}.ts`;
+      if (isFile(tsCandidate)) {
+        return this.normalizeUrl(tsCandidate);
+      }
+    }
+
+    for (const extension of EXTENSION_CANDIDATES) {
+      const candidateWithExtension = `${candidate}${extension}`;
+      if (isFile(candidateWithExtension)) {
+        return this.normalizeUrl(candidateWithExtension);
+      }
+    }
+
+    if (isDirectory(candidate)) {
+      for (const indexName of INDEX_CANDIDATES) {
+        const indexCandidate = path.join(candidate, indexName);
+        if (isFile(indexCandidate)) {
+          return this.normalizeUrl(indexCandidate);
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Phase 1 — Module classification (Algorithm 8)
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Classifies changed modules and their transitive neighbourhood into
+   * `accepted` and `declined` sets.
+   *
+   * The algorithm is the fixed point of the paper:
+   *
+   * - a pending module is accepted when any of its imports is accepted;
+   * - a pending module is declined when all of its imports are declined
+   *   (an empty import set is therefore vacuously declined);
+   * - any module still pending after the fixed point is declined.
+   */
+  classify(stashed: Set<string>, externals: Set<string>): Classification {
+    // Changed files are re-read from disk: their import graph may have
+    // changed since the previous snapshot.
+    for (const url of stashed) {
+      this.importCache.delete(this.normalizeUrl(url));
+    }
+
+    const accepted = new Set<string>();
+    const declined = new Set<string>();
+
+    for (const url of stashed) {
+      accepted.add(this.normalizeUrl(url));
+    }
+
+    for (const url of externals) {
+      declined.add(this.normalizeUrl(url));
+    }
+
+    // If a changed file is also declared external, the external restriction
+    // wins: it cannot be hot-replaced.
+    for (const url of declined) {
+      accepted.delete(url);
+    }
+
+    const pending = new Set<string>();
+
+    for (const url of accepted) {
+      for (const dependency of this.getImports(url)) {
+        if (!accepted.has(dependency) && !declined.has(dependency)) {
+          pending.add(dependency);
+        }
+      }
+    }
+
+    let progress = true;
+
+    while (progress) {
+      progress = false;
+
+      for (const url of Array.from(pending)) {
+        const imports = this.getImports(url);
+        const hasAcceptedImport = Array.from(imports).some((dependency) =>
+          accepted.has(this.normalizeUrl(dependency)),
+        );
+        const allImportsDeclined =
+          imports.size === 0 ||
+          Array.from(imports).every((dependency) =>
+            declined.has(this.normalizeUrl(dependency)),
+          );
+
+        if (hasAcceptedImport) {
+          accepted.add(url);
+          pending.delete(url);
+          progress = true;
+          continue;
+        }
+
+        if (allImportsDeclined) {
+          declined.add(url);
+          pending.delete(url);
+          progress = true;
+          continue;
+        }
+
+        for (const dependency of imports) {
+          const normalizedDependency = this.normalizeUrl(dependency);
+
+          if (
+            !accepted.has(normalizedDependency) &&
+            !declined.has(normalizedDependency) &&
+            !pending.has(normalizedDependency)
+          ) {
+            pending.add(normalizedDependency);
+            progress = true;
+          }
+        }
+      }
+    }
+
+    // Modules caught in an undecided import cycle cannot be safely replaced.
+    for (const url of pending) {
+      declined.add(url);
+    }
+
+    pending.clear();
+
+    return { accepted, declined };
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Phase 2 — Stale-entry detection (Algorithm 9)
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Collects the transitive dependency tree of a module, stopping at declined
+   * modules and never entering a module twice.
+   *
+   * A declined module itself is not included in the tree.
+   */
+  getDependencies(root: string, declined: Set<string>): Set<string> {
+    const normalizedRoot = this.normalizeUrl(root);
+    const declinedSet = new Set<string>(
+      Array.from(declined, (url) => this.normalizeUrl(url)),
+    );
+
+    const dependencies = new Set<string>();
+
+    const visit = (url: string): void => {
+      if (dependencies.has(url) || declinedSet.has(url)) {
+        return;
+      }
+
+      dependencies.add(url);
+
+      for (const child of this.getImports(url)) {
+        visit(this.normalizeUrl(child));
+      }
+    };
+
+    visit(normalizedRoot);
+
+    return dependencies;
+  }
+
+  /**
+   * Determines which component entries must be reloaded because their
+   * dependency trees intersect the accepted module set.
+   *
+   * The whole tree of every stale entry is folded into `accepted` so that
+   * Phase 3 invalidates every module participating in the stale entry's
+   * runtime closure.
+   */
+  detectStale(
+    entries: LoadedEntry[],
+    accepted: Set<string>,
+    declined: Set<string>,
+  ): LoadedEntry[] {
+    const staleEntries: LoadedEntry[] = [];
+
+    for (const entry of entries) {
+      const tree = this.getDependencies(entry.url, declined);
+
+      const isStale = Array.from(tree).some((module) =>
+        accepted.has(this.normalizeUrl(module)),
+      );
+
+      if (!isStale) {
+        continue;
+      }
+
+      for (const module of tree) {
+        accepted.add(this.normalizeUrl(module));
+      }
+
+      staleEntries.push(entry);
+    }
+
+    return staleEntries;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Phase 3 — Transactional module reload (Algorithm 10)
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Backs up and invalidates the module caches of every accepted module.
+   *
+   * The returned map is keyed by normalized module URL and contains enough
+   * information to restore the previous module (or component registration)
+   * after a failed reload.
+   */
+  invalidateCaches(accepted: Set<string>): Map<string, any> {
+    const backup = new Map<string, any>();
+    const processed = new Set<string>();
+
+    for (const url of accepted) {
+      const normalized = this.normalizeUrl(url);
+
+      if (processed.has(normalized)) {
+        continue;
+      }
+      processed.add(normalized);
+
+      const cache = nodeRequire.cache as Record<string, any> | undefined;
+      const cached = cache?.[normalized] ?? null;
+
+      // Prefer a component explicitly registered through the loader, so that
+      // synthetic fixtures and in-memory modules work without a real disk
+      // module graph.
+      const registered =
+        Loader.moduleRegistry.get(url) ??
+        Loader.moduleRegistry.get(normalized) ??
+        undefined;
+
+      const record: HmrBackupRecord = {
+        resolved: normalized,
+        cached,
+        exports: registered ?? cached?.exports ?? undefined,
+      };
+
+      backup.set(normalized, record);
+
+      // The source may have changed, so invalidate the parsed import graph.
+      this.importCache.delete(normalized);
+
+      if (cache && cached) {
+        delete cache[normalized];
+      }
+    }
+
+    return backup;
+  }
+
+  /**
+   * Restores module caches after a failed reload.
+   *
+   * This function is synchronous and intentionally does not throw.  If a
+   * cache entry cannot be restored, the original error from the failed reload
+   * is still the one propagated to the caller.
+   */
+  restoreCaches(backup: Map<string, any>): void {
+    const cache = nodeRequire.cache as Record<string, any> | undefined;
+
+    for (const record of backup.values()) {
+      const typedRecord = record as HmrBackupRecord;
+
+      if (cache) {
+        if (typedRecord.cached) {
+          cache[typedRecord.resolved] = typedRecord.cached;
+        } else {
+          delete cache[typedRecord.resolved];
+        }
+      }
+
+      this.importCache.delete(typedRecord.resolved);
+    }
+  }
+
+  /**
+   * Transactionally replaces the fibers of every stale entry.
+   *
+   * On success:
+   *
+   * 1. module caches are invalidated;
+   * 2. every stale entry's old fiber is retired and drained through the
+   *    lifecycle, preserving the guarded-withdrawal ordering;
+   * 3. fresh component modules are imported and new fibers are instantiated;
+   * 4. all new fibers are awaited to quiescence.
+   *
+   * On failure:
+   *
+   * 1. module caches are restored;
+   * 2. every fiber currently present on a stale entry (including partially
+   *    created fresh fibers) is retired and drained;
+   * 3. fibers are recreated from the backed-up previous components;
+   * 4. the original error is rethrown.
+   */
+  async reload(
+    ctx: Context,
+    accepted: Set<string>,
+    staleEntries: LoadedEntry[],
+  ): Promise<void> {
+    const backup = this.invalidateCaches(accepted);
+
+    // Capture parent contexts *before* disposing old fibers: after disposal
+    // the old fiber's `parentCtx` may no longer be the right target for a
+    // fresh instantiation.
+    const parents = staleEntries.map((entry) =>
+      entry.fiber ? entry.fiber.parentCtx : ctx,
+    );
+
+    const created: Fiber[] = [];
+
+    try {
+      for (let index = 0; index < staleEntries.length; index += 1) {
+        const entry = staleEntries[index];
+
+        if (entry.fiber) {
+          await this.disposeFiber(entry.fiber);
+        }
+
+        entry.fiber = null;
+
+        if (entry.disabled) {
+          continue;
+        }
+
+        const component = await this.importComponent(entry.url);
+        const parent = parents[index] ?? ctx;
+        const fiber = parent.use(component, entry.config);
+
+        entry.fiber = fiber;
+        created.push(fiber);
+      }
+
+      if (created.length > 0) {
+        await Promise.all(created.map((fiber) => fiber.awaitQuiescence()));
+      }
+    } catch (error) {
+      // Rollback phase.
+      this.restoreCaches(backup);
+
+      const restored: Fiber[] = [];
+
+      for (let index = 0; index < staleEntries.length; index += 1) {
+        const entry = staleEntries[index];
+
+        if (entry.fiber) {
+          await this.disposeFiber(entry.fiber);
+          entry.fiber = null;
+        }
+
+        if (entry.disabled) {
+          continue;
+        }
+
+        const record = backup.get(this.normalizeUrl(entry.url)) as
+          | HmrBackupRecord
+          | undefined;
+        const oldComponent = record
+          ? this.extractComponent(record.exports)
+          : null;
+
+        if (oldComponent) {
+          const parent = parents[index] ?? ctx;
+          const fiber = parent.use(oldComponent, entry.config);
+
+          entry.fiber = fiber;
+          restored.push(fiber);
+        }
+      }
+
+      if (restored.length > 0) {
+        await Promise.all(restored.map((fiber) => fiber.awaitQuiescence()));
+      }
+
+      throw error;
+    }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Internal helpers
+   * ---------------------------------------------------------------- */
+
+  /**
+   * Retires a fiber and waits until it has fully quiesced.
+   *
+   * This is the correct way to dispose a fiber before replacement: it drives
+   * the fiber through the lifecycle's UNLOADING state, notifies dependents,
+   * and only then runs the accumulated inverse.
+   */
+  private async disposeFiber(fiber: Fiber): Promise<void> {
+    if (fiber.state !== 'INACTIVE' && fiber.state !== 'FAILED') {
+      fiber.markRetired();
+      await fiber.awaitQuiescence();
+      return;
+    }
+
+    fiber.markRetired();
+    await fiber.awaitQuiescence();
+  }
+
+  /**
+   * Imports a fresh component module by URL.
+   *
+   * Modules registered through `Loader.moduleRegistry` take precedence over
+   * disk imports, which lets tests and in-memory fixtures participate in HMR
+   * without writing temporary files to disk.
+   */
+  private async importComponent(url: string): Promise<Component> {
+    const registered =
+      Loader.moduleRegistry.get(url) ??
+      Loader.moduleRegistry.get(this.normalizeUrl(url));
+
+    if (registered) {
+      return registered;
+    }
+
+    const normalized = this.normalizeUrl(url);
+    const moduleUrl = pathToFileURL(normalized).href;
+    const mod = await import(moduleUrl);
+    const component = this.extractComponent(mod);
+
+    if (!component) {
+      throw new Error(
+        `HMR.importComponent: module at '${url}' does not export a valid ` +
+          'Cordis component.',
+      );
+    }
+
+    return component;
+  }
+
+  /**
+   * Extracts a Cordis component from a module namespace, CommonJS export, or
+   * registered component object.
+   */
+  private extractComponent(value: any): Component | null {
+    if (
+      value &&
+      typeof value.apply === 'function' &&
+      Array.isArray(value.inject) &&
+      Array.isArray(value.provide)
+    ) {
+      return value as Component;
+    }
+
+    if (value && typeof value === 'object') {
+      const candidate = value.default ?? value.component;
+
+      if (
+        candidate &&
+        typeof candidate.apply === 'function' &&
+        Array.isArray(candidate.inject) &&
+        Array.isArray(candidate.provide)
+      ) {
+        return candidate as Component;
+      }
+    }
+
+    return null;
+  }
+}
+```

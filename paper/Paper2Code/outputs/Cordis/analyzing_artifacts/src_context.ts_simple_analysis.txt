@@ -1,0 +1,297 @@
+# Logic Analysis: `src/context.ts`
+
+This document analyzes the design and implementation of the `Context` class, which is the runtime realization of the paper’s unified context type `Γ∞` and the foundation for all effect/coeffect operations in Cordis.
+
+---
+
+## 1. Role in the Architecture
+
+`src/context.ts` implements the first-class context object through which every component interaction flows. In the paper’s notation:
+
+```
+Γ∞ = μΓ. Γ × (Γ → Γ) × Σ
+```
+
+The `Context` class maps this structure as follows:
+
+| Theory | `Context` member |
+|---|---|
+| Recursive context state `Γ` | `parent` pointer, `fiber` owner, child context tree |
+| Accumulator `Γ → Γ` | `dispose: Dispose` |
+| Coeffect context `Σ` | private slot maps `store`, `isolate`, `intercept` |
+
+All context mutations — `ctx.set`, `ctx.use`, and general `ctx.effect` calls — must flow through `ctx.effect`, so that every inverse is composed onto an accumulator and can be reverted when a component unloads.
+
+---
+
+## 2. Slot Model and Derivation Semantics
+
+The paper’s Definition 27 distinguishes **in-place** and **derived** effect realizations. Isolation and interception are derived realizations: they do not modify the shared coeffect table, and recovery simply discards the derived context.
+
+The implementation must honor this while also supporting the paper’s managed realm reassignment, which mutates an entry context and expects descendant fiber contexts to observe the change.
+
+### 2.1 Slot Sharing Rules
+
+We adopt the following model:
+
+- The root `Context` creates the three maps:
+  - `store: Map<Realm, any>`
+  - `isolate: Map<Key, Realm>`
+  - `intercept: Map<Key, Metadata>`
+- `derive()` creates a child `Context` whose `store`, `isolate`, and `intercept` initially reference the same `Map` objects as the parent.
+  - This implements “derived realization leaves the input intact”.
+  - This is also why `ctx.isolate` and `ctx.intercept` can safely return new contexts: the parent table is never mutated.
+- The `store` map stays shared across all derived contexts in a context tree.
+  - When a fiber calls `ctx.set` on its derived context, it writes to the shared store, exactly as the paper’s “shared table” requires.
+- `isolate` and `intercept` are shared by default, but `ctx.isolate()` and `ctx.intercept()` replace the child’s respective map with a shallow copy plus the local override.
+
+### 2.2 Why This Supports Managed Realms
+
+In `Loader.patchIsolation` (Algorithm 7), the loader mutates `entry.ctx[@@isolate]` in place. A fiber context created by `entry.ctx.derive()` shares the same `isolate` `Map`, so the fiber immediately sees the new realm mapping. This is essential for correctness of realm reassignment without re-deriving the fiber context.
+
+If a component explicitly calls `ctx.isolate()`, that child receives its own copy of the isolate map and is intentionally insulated from later changes — which is exactly the purpose of isolation.
+
+---
+
+## 3. Class Member Analysis
+
+### 3.1 `constructor(parent?: Context | null)`
+
+- Sets `parent`.
+- Inherits `fiber` from parent if any.
+- Inherits `dispose` from parent as the initial accumulator, or uses the identity disposer for the root.
+- Initializes `store`, `isolate`, and `intercept` by sharing the parent’s maps, or creates fresh maps for the root.
+
+This constructor is the basis of `derive()`.
+
+### 3.2 `derive(): Context`
+
+Creates a child context:
+
+- `const child = new Context(this)`
+- The child shares the parent’s slot maps.
+- The child inherits the parent’s `fiber` owner.
+- The child inherits the parent’s `dispose` function as an initial value; any new `ctx.effect` on the child will shadow it locally.
+
+This is the operation used both for fiber context creation and as the base for isolation/interception.
+
+### 3.3 `effect(callback: EffectCallback): Dispose`
+
+Delegates to `Lifecycle.effect(this, callback)`.
+
+```ts
+effect(callback) {
+  return Lifecycle.effect(this, callback);
+}
+```
+
+`Lifecycle.effect` is a thin wrapper over `EffectEngine.effect`. This ensures:
+
+- Callbacks are treated as effect iterators.
+- Yielded inverses are composed in LIFO order.
+- The returned disposer is idempotent via the `armed` guard.
+- The disposer is prepended to `ctx.dispose`.
+
+This is the single mutation primitive required by Section 5.1.1 of the paper.
+
+### 3.4 `get(key: Key): any`
+
+Implements the two-layer realm resolution plus interception:
+
+1. Resolve the realm:
+   - `realm = isolate.get(key) ?? key`
+2. Read from the shared store:
+   - `value = store.get(realm)`
+3. If interception metadata exists for `key` and the stored value is a provider function, apply the metadata:
+   - `value = value(meta)`
+4. Return the value; return `undefined` if absent.
+
+This realizes the paper’s `get(k, μ)` behavior in the common case. The design’s `get(key)` signature omits explicit component metadata, so we use context-carried interception metadata only, defaulting to a right-biased merge.
+
+### 3.5 `set(key: Key, value: any): Dispose`
+
+Delegates to `coeffect.set(this, key, value)`.
+
+`coeffect.set` is itself implemented as a `ctx.effect`:
+
+- Resolve realm from `this.isolate`.
+- Write `store.set(realm, value)`.
+- Call `notify(ctx, [key])`.
+- Return an inverse that deletes the store entry and calls `notify(ctx, [key])` again.
+
+Because it uses `ctx.effect`, the returned disposer is tracked in `ctx.dispose` and is idempotent.
+
+If `this.fiber` exists, `coeffect.set` records the key in the fiber’s runtime-provided set, so `providedKeys(fiber)` can include keys actually written even if the component’s declared `provide` set is incomplete.
+
+### 3.6 `isolate(key: Key, realm?: Realm): Context`
+
+Implements Definition 29:
+
+1. Create a derived context via `this.derive()`.
+2. Copy the inherited isolate map into a new map:
+   - `next = new Map(child.isolate)`
+3. Set the override:
+   - `next.set(key, realm ?? Symbol())`
+4. Replace the child’s isolate map with `next`.
+
+This does **not** modify `store`, does **not** call `notify`, and does **not** create a tracked effect. It is purely a derived realization.
+
+### 3.7 `intercept(key: Key, metadata: Metadata): Context`
+
+Implements Definition 31:
+
+1. Create a derived context via `this.derive()`.
+2. Copy the inherited intercept map into a new map:
+   - `next = new Map(child.intercept)`
+3. Merge `metadata` onto the existing metadata for `key`, using the configured right-biased merge:
+   - For plain objects: `{ ...old, ...metadata }`
+   - For non-object values: `metadata` replaces `old`
+4. Replace the child’s intercept map with `next`.
+
+This does **not** trigger reload or notification, because interception affects only how a dependency is used, not whether it is satisfied.
+
+### 3.8 `use(component: Component, config?: any): Fiber`
+
+Delegates to `Lifecycle.use(this, component, config)`.
+
+The lifecycle module will:
+
+1. Create a new `Fiber` with:
+   - `uid`
+   - `parentCtx = this`
+   - `ctx = this.derive()`
+   - `inject = component.inject`
+   - `provide = component.provide`
+   - `apply` bound to `config`
+2. Set `fiber.ctx.fiber = fiber`.
+3. Call `this.effect(callback)` where:
+   - `callback` calls `refresh(fiber)`
+   - the returned inverse sets `fiber.target = null` and calls `unload(fiber)`
+
+This realizes the registration primitive `O-Insert` / `O-Retire` from Definition 47.
+
+---
+
+## 4. Internal Slot Access
+
+Because `store`, `isolate`, and `intercept` are private in TypeScript, other modules (`effect.ts`, `coeffect.ts`, `lifecycle.ts`, `loader.ts`) need access. We will expose package-internal accessors, not part of the public API:
+
+- `_storeMap(): Map<Realm, any>`
+- `_isolateMap(): Map<Key, Realm>`
+- `_interceptMap(): Map<Key, Metadata>`
+
+Alternatively, keep the maps private but expose symbol-keyed constants such as `@@store`, `@@isolate`, and `@@intercept`. The important invariant is that all slot mutation goes through the `Context` class or the explicitly coordinated internal modules.
+
+---
+
+## 5. Lifecycle Interaction and Invariants
+
+### 5.1 Single Mutation Primitive
+
+`ctx.set` and `ctx.use` both reduce to `ctx.effect`. This satisfies the paper’s requirement that every effect is tracked and revertible.
+
+### 5.2 LIFO Disposal
+
+`EffectEngine.effect` composes disposers as:
+
+```ts
+ctx.dispose = newDisposer ∘ ctx.dispose
+```
+
+Therefore, disposing a context runs effects in reverse order of their creation. This is the implementation of the twisted composition monoid and Theorem 16.
+
+### 5.3 Idempotent Disposal
+
+The `armed` flag ensures a disposer can only execute once. Calling `dispose()` twice is a no-op. This prevents running an inverse at a state where its effect was never applied.
+
+### 5.4 Fiber Ownership and `fiber.ctx`
+
+Every fiber runs in its own derived context. The `fiber` pointer on a context identifies which component lifecycle owns it. This is essential for:
+
+- Proxy-mediated access (Algorithm 6), though the proxy itself lives outside `context.ts`.
+- Recording runtime-provided keys during `ctx.set`.
+- Realm-aware notification.
+
+`derive()` preserves `fiber`, so isolated child contexts inside a component still belong to the same fiber.
+
+### 5.5 Realm-Aware Notification
+
+`ctx.set` calls `notify` on the context where the write occurred. `notify` compares the changed realm with each dependent fiber’s resolved realm. This is why `Context.isolate` must create a new isolate map while sharing the store: a binding written in an isolated realm is visible only to fibers that resolve the same key to that realm.
+
+### 5.6 No Direct Store Mutation
+
+The `store` map is private. Components cannot mutate it directly; they must call `ctx.set`. This preserves the invariant that every mutation is paired with an inverse.
+
+---
+
+## 6. Edge Cases and Pragmatic Decisions
+
+### 6.1 `get` With Function-Valued Coeffects
+
+The paper’s interception model stores provider functions: `σ(k) : M_k → V_k`. Our `Context.get` detects:
+
+- if interception metadata exists for the key, and
+- if the stored value is a function,
+
+then it invokes the function with the merged metadata. Otherwise it returns the raw stored value.
+
+This is a pragmatic resolution of the API mismatch between the paper’s typed `get(k, μ)` and the design’s `get(key)`.
+
+### 6.2 Missing Bindings
+
+`ctx.get(key)` returns `undefined` when the realm has no value. The stricter proxy-mediated access — which throws `INACTIVE_ACCESS` or `UNDECLARED_ACCESS` — is outside `context.ts`.
+
+### 6.3 Isolation Snapshot vs Shared Reference
+
+`ctx.isolate()` creates a snapshot for the isolated key, while ordinary `derive()` shares the isolate map. This means:
+
+- Managed realm reassignment works for fibers that did not explicitly isolate the key.
+- Explicit isolation is honored as a per-component scope and is not overwritten by a parent realm change.
+
+### 6.4 `Context.dispose` vs `Fiber.dispose`
+
+`Context.dispose` is the context’s own accumulator, used when a component calls `ctx.effect` directly. `Fiber.dispose` is the lifecycle’s authoritative accumulator for the whole activation. They are distinct fields, as in the design.
+
+In the common pattern, a component’s `apply` function yields the disposers returned by `ctx.effect` / `ctx.set`, so those disposers become part of `Fiber.dispose` through the effect iterator.
+
+### 6.5 Circular Dependency Strategy
+
+To avoid runtime circular imports:
+
+- `context.ts` imports `Lifecycle` and `coeffect` at runtime.
+- `lifecycle.ts` imports `Fiber` at runtime and `Context` as a type only.
+- `fiber.ts` imports `Context` as a type only, and registers `Lifecycle.refresh` via a static callback to avoid a value-level cycle.
+- `effect.ts` and `coeffect.ts` import `Context` as a type only.
+
+This allows `Context` to delegate to lifecycle/coeffect without creating a module cycle.
+
+---
+
+## 7. Mapping to `config.yaml`
+
+| Config key | Implementation consequence |
+|---|---|
+| `core.contextSlots.store/isolate/intercept` | The three private maps on `Context` |
+| `core.effectTracking.inverseComposition: LIFO` | `ctx.dispose = newDisposer ∘ ctx.dispose` |
+| `core.effectTracking.armedGuard: true` | Disposal executes at most once |
+| `core.effectTracking.guardCheckPerIteration: true` | `EffectEngine.execute` checks guard before each iteration |
+| `core.coeffect.isolationRealms: true` | `ctx.isolate` derives a context with an overridden realm map |
+| `core.coeffect.interceptionMetadataMerge: right-biased` | New metadata overrides old metadata in `ctx.intercept` |
+| `core.lifecycle.states` | `fiber.state` is one of `INACTIVE`, `LOADING`, `ACTIVE`, `UNLOADING`, `FAILED` |
+| `loader.reconciliationKey: id` | Entries are keyed by `id`; `Context.use` is the lower-level primitive the loader drives |
+
+---
+
+## 8. Testing Expectations for `src/context.ts`
+
+The core tests should validate:
+
+1. `ctx.effect` composes disposers in LIFO order.
+2. `ctx.set` installs a binding and removes it on disposal.
+3. `ctx.isolate` creates independent bindings for the same logical key.
+4. `ctx.intercept` merges metadata and affects `ctx.get` via a provider function.
+5. `ctx.derive` shares the store but allows isolation overrides.
+6. `ctx.use` creates a fiber whose `ctx` is derived from the parent and whose `fiber` pointer is set.
+7. A derived context inherits the parent’s `fiber` owner unless explicitly rebound by `use`.
+
+These tests ensure the context layer is a faithful, executable foundation for the lifecycle, loader, and HMR layers.

@@ -1,0 +1,33 @@
+----------------------------------------
+[Implementation approach]
+We implement a TypeScript meta-framework that directly mirrors the paper's Cordis architecture. The core is a first-class Context object carrying symbol-keyed slots (@@store, @@isolate, @@intercept) and a single effect primitive, ctx.effect, built on async generator iterators: each yielded value is an inverse, and the runtime composes them LIFO into an accumulator. Coeffect operations (set/get/isolate/intercept) are implemented as effects on the store and as derived child contexts; notify() re-evaluates affected fibers' target views. The fiber lifecycle implements the inertial state machine of Section 4.3: refresh computes target, reload executes the component's effect iterator while committing a resolved view, and unload drains dependents (guarded withdrawal) before running the accumulator. The loader reconciles declarative entry trees via keyed diff and managed isolation realms. HMR performs module classification (accepted/declined), stale-entry detection, and transactional reload with cache backup/restore. We use Vitest for the test suite and fast-check for property-based validation of recovery exactness, ordering, progress, and confluence. The reference (mock) plugin ecosystem is a small Koishi-like set: db-provider, adapter, command, and admin-console components.
+
+----------------------------------------
+[File list]
+- src/types.ts
+- src/context.ts
+- src/effect.ts
+- src/coeffect.ts
+- src/fiber.ts
+- src/lifecycle.ts
+- src/loader.ts
+- src/hmr.ts
+- src/index.ts
+- main.ts
+- package.json
+- tsconfig.json
+- tests/core.test.ts
+- tests/property.test.ts
+
+----------------------------------------
+[Data structures and interfaces]
+classDiagramclass Context {+parent: Context | null+fiber: Fiber | null-store: Map~Realm, any~-isolate: Map~Key, Realm~-intercept: Map~Key, Metadata~+dispose: Dispose+effect(callback: EffectCallback): Dispose+get(key: Key): any+set(key: Key, value: any): Dispose+isolate(key: Key, realm?: Realm): Context+intercept(key: Key, metadata: Metadata): Context+use(component: Component, config?: any): Fiber}class Fiber {+uid: number+parentCtx: Context+ctx: Context+inject: Key[]+provide: Key[]+apply: EffectCallback+state: LifecycleState+target: Map~Key, number~ | null+committed: Map~Key, number~ | null+dispose: Dispose+inertia: Promise~void~ | null+retired: boolean+refresh(): void+awaitQuiescence(): Promise~void~}class Lifecycle {+execute(callback: EffectCallback, guard: Guard): Promise~Dispose~+refresh(fiber: Fiber): void+reload(fiber: Fiber): Promise~void~+unload(fiber: Fiber): Promise~void~+notify(ctx: Context, keys: Key[]): Fiber[]+computeTarget(fiber: Fiber): Map~Key, number~ | null+resolveView(fiber: Fiber): Map~Key, number~+providedKeys(fiber: Fiber): Key[]}class Loader {+context: Context+entries: Map~string, LoadedEntry~+reconcile(entries: Entry[]): Promise~void~+applyChange(entry: Entry): Promise~void~+patchIsolation(entry: LoadedEntry, newIsolation: Map~Key, Realm~): Promise~void~+diffEntries(oldEntries: Entry[], newEntries: Entry[]): Change[]}class LoadedEntry {+id: string+url: string+config: any+disabled: boolean+fiber: Fiber | null+isolate: Map~Key, Realm~+intercept: Map~Key, Metadata~+applyConfig(config: any): Promise~void~}class Entry {+id: string+url: string+config: any+disabled: boolean+isolate?: boolean | string+intercept?: Record~string, any~+children?: Entry[]}class Component {+inject: Key[]+provide: Key[]+apply(ctx: Context, config: any): EffectCallback | Dispose}class HMR {+classify(stashed: Set~string~, externals: Set~string~): Classification+detectStale(entries: LoadedEntry[], accepted: Set~string~, declined: Set~string~): LoadedEntry[]+reload(ctx: Context, accepted: Set~string~, stale: LoadedEntry[]): Promise~void~+invalidateCaches(accepted: Set~string~): Map~string, any~+restoreCaches(backup: Map~string, any~): void}Context --> Fiber : creates / ownsContext --> Lifecycle : uses primitivesFiber --> Context : derived child ctxLifecycle --> Fiber : state machineLoader --> Context : orchestratesLoader --> LoadedEntry : wrapsLoadedEntry --> Fiber : instantiatesLoader --> Entry : reconcilesHMR --> Loader : stale entriesHMR --> Context : reloadComponent --> Fiber : applies effect
+
+----------------------------------------
+[Program call flow]
+sequenceDiagramparticipant M as Mainparticipant C as Contextparticipant L as Loaderparticipant F as Fiberparticipant LC as Lifecycleparticipant H as HMRM->>C: new Context()M->>L: new Loader(C)M->>L: reconcile([dbEntry, adapterEntry, cmdEntry])L->>C: use(DbComponent, {})C->>F: new Fiber(uid, parentCtx=C, inject=[])C->>F: fiber.ctx = deriveChildContext(C)C->>LC: effect(callback)Note over LC: callback calls refresh(F)LC->>F: refresh()F->>F: target = computeTarget()alt target != nullLC->>F: reload()F->>F: committed = resolveView(inject)LC->>LC: execute(apply, guard)LC-->>F: composite inverseF->>F: state = ACTIVE, dispose = accumulatorLC->>F: notify(ctx, providedKeys(F))else target == nullLC->>F: unload()F->>LC: await all(notify(ctx, providedKeys(F)))F->>F: dispose()F->>F: state = INACTIVEendL->>C: use(CommandComponent, {})C->>F2: new Fiber(uid, parentCtx=C, inject=[db])F2->>LC: refresh()alt dependencies missingLC->>F2: target = nullNote over F2: stays INACTIVE until db is providedelse dependencies satisfiedLC->>F2: reload()F2->>F2: state = ACTIVEendM->>L: applyChange(cmdEntry)L->>F2: fiber.retired = trueF2->>LC: refresh() -> target = nullF2->>LC: unload()LC->>LC: drain dependents (adapter stays ACTIVE)F2->>F2: dispose()F2->>F2: state = INACTIVEM->>H: classify(stashed, externals)H-->>M: {accepted, declined}M->>H: detectStale([cmdEntry], accepted, declined)H-->>M: staleEntries = [cmdEntry]M->>H: reload(C, accepted, staleEntries)H->>L: applyChange(cmdEntry with fresh module)L->>C: use(FreshCommandComponent, {})C->>F3: new Fiber(...)F3->>LC: refresh()LC->>F3: reload()F3->>F3: state = ACTIVEM->>M: print quiescent report
+
+----------------------------------------
+[Anything UNCLEAR]
+The paper does not specify the merge semantics for interception metadata beyond right-bias; we require each key to supply a merge function or default to overwrite. The provided(fiber) set is not tracked explicitly in the formal model, so we instrument effect execution to record keys actually written and fall back to the component's provide declaration. HMR's import graph is abstract; without bundler hooks, static scanning may miss dynamic imports. The observational equivalence for state recovery is application-defined; we default to deep equality and allow per-key equivalence hooks in tests.
+

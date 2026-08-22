@@ -1,0 +1,383 @@
+# Logic Analysis: `src/fiber.ts`
+
+## 1. Role of `src/fiber.ts`
+
+`src/fiber.ts` defines the runtime representation of a **fiber**: one instantiation of a component, carrying its own lifecycle state, coeffect view, and effect accumulator. In the paper this is Definition 44:
+
+```
+⟨d, p, e, π, σ, τ, θ⟩
+```
+
+The `Fiber` class is intentionally a **mutable data record**. The actual state machine logic lives in `src/lifecycle.ts`; `Fiber` exposes the fields and two small convenience methods so that `Lifecycle`, the `Loader`, and tests can observe and drive the fiber without reaching into private context internals.
+
+Because the design already places `inject`, `provide`, `apply`, `state`, `target`, `committed`, `dispose`, `inertia`, `retired`, `error`, `parentCtx`, and `ctx` on `Fiber`, the class must balance two concerns:
+
+- faithfully mirror the formal fiber tuple;
+- be simple enough that `Lifecycle` can manipulate it transactionally.
+
+---
+
+## 2. Mapping from the Paper to the `Fiber` Class
+
+| Formal notion (Section 4.1) | `Fiber` member |
+|---|---|
+| fiber name `n : 𝔑` | `uid: number` |
+| parent pointer `π` | `parentCtx: Context` + `parentCtx.fiber` |
+| child coeffect table `σ` | logically owned through `ctx` and the shared store |
+| lifecycle state `θ` | `state: LifecycleState` plus `committed` and `dispose` |
+| accumulator `g` | `dispose: Dispose` |
+| committed view `ω` | `committed: Map<Key, number> | null` |
+| target view `target(γ, n)` | `target: Map<Key, number> | null` |
+| retirement flag `τ` | `retired: boolean` |
+| error outcome `ζ` | `error: unknown` and `state === 'FAILED'` |
+| in-flight transition handle | `inertia: Promise<void> | null` |
+| component effect function `e` | `apply: EffectCallback` |
+
+This mapping is consistent with the design’s Table 2 correspondence.
+
+---
+
+## 3. Field-by-Field Analysis
+
+### 3.1 `uid: number`
+
+- Must be globally unique and monotonically increasing.
+- UIDs are never reused. This is what makes `target` and `committed` maps safe: a provider can be replaced by a *different* fiber with a different UID, so a dependent can never mistake the new provider for the old one.
+- UIDs are used as the values in `target` and `committed`. They are **not** references to `Fiber` objects, avoiding retention cycles and making view comparison cheap.
+- Because JavaScript is single-threaded, a module-level counter is sufficient; no atomicity protocol is needed.
+
+### 3.2 `parentCtx: Context`
+
+- The context on which `ctx.use(component, config)` was called.
+- This is **not** necessarily the parent fiber; the parent fiber is `parentCtx.fiber`.
+- It is used for two purposes:
+  1. Deriving the child context `fiber.ctx`.
+  2. Walking up the fiber chain in proxy-mediated access (`src/context.ts`, Algorithm 6): `fiber = fiber.parentCtx.fiber`.
+- `parentCtx` is immutable after construction. The fiber tree is fixed at instantiation time.
+
+### 3.3 `ctx: Context`
+
+- The derived child context in which the component’s `apply` runs.
+- It must satisfy:
+  - `fiber.ctx.parent === fiber.parentCtx`
+  - `fiber.ctx.fiber === fiber`
+- It carries the component’s isolation and interception overrides. Conceptually, `fiber.ctx` is the “realm-adjusted” view of the parent context.
+- Important implementation caveat: although `Context.derive()` may be described as “sharing slots”, the derived context must **not** share mutable `Map` instances in a way that would let a fiber’s `ctx.isolate(...)` or `ctx.intercept(...)` mutate the parent context. It should use parent-fallback semantics: the child owns its overrides and reads through to the parent only where it has not overridden.
+
+### 3.4 `inject: Key[]`
+
+- The component’s declared dependencies `d`.
+- It is immutable after construction.
+- It should not contain duplicates. If duplicates are present, target/committed maps will silently collapse them; the safest approach is to copy and deduplicate in the constructor or in `Lifecycle.use`.
+- `inject` is used by:
+  - `Lifecycle.computeTarget(fiber)`,
+  - `Lifecycle.resolveView(fiber)`,
+  - `notify(...)` to decide whether a changed key affects this fiber,
+  - proxy access to decide whether an `INACTIVE_ACCESS` error should be thrown.
+
+### 3.5 `provide: Key[]`
+
+- The component’s declared provisions `p`.
+- Used by `Lifecycle.providedKeys(fiber)` during unload, so the runtime can notify dependents that the fiber is leaving.
+- The design says runtime-observed writes can be tracked and unioned with `provide`. Fiber itself does not need an extra public field for observed writes; `Lifecycle` or `EffectEngine` can keep a `WeakMap<Fiber, Set<Key>>` internally if that refinement is implemented.
+- In the formal model, `provide` is a bound: no effect of the fiber writes outside `p`. The implementation may rely on this trust boundary.
+
+### 3.6 `apply: EffectCallback`
+
+- The component’s effect function bound to `fiber.ctx` and `config`.
+- It must be **re-invocable**: the same fiber may activate, deactivate, and reactivate, calling `apply` again each time. It is a *factory* of an effect iterator, not a one-shot effect.
+- Type normalization is required. `Component.apply` returns `EffectCallback | Dispose`; `Lifecycle.use` must convert the `Dispose` form into an `EffectCallback` that produces a degenerate iterator yielding that single inverse. The `Fiber` constructor should receive an already-normalized `EffectCallback`.
+
+### 3.7 `state: LifecycleState`
+
+- One of: `'INACTIVE' | 'LOADING' | 'ACTIVE' | 'UNLOADING' | 'FAILED'` (per `config.yaml`).
+- This is a coarse simplification of the paper’s `θ`:
+  - `INACTIVE` ↔ `Inactive(⊥)`
+  - `FAILED` ↔ `Inactive(ξ)` with `error` set
+  - `LOADING` ↔ `Reloading(i, g, ω)`
+  - `ACTIVE` ↔ `Active(g, ω)`
+  - `UNLOADING` ↔ `Unloading(g, ω, ζ)`
+- The accumulator `g` and committed view `ω` are stored separately (`dispose` and `committed`), and the remaining iterator `i` is held inside the running `reload` task, so the coarse state string is sufficient.
+
+### 3.8 `target: Map<Key, number> | null`
+
+- The *desired* state: what the fiber’s dependencies currently resolve to, or `null` if it should not run.
+- `null` means `⊥`: retired, dependencies unsatisfied, or failed.
+- An **empty** `Map` means “should run, but has no dependencies”.
+- It is recomputed by `Lifecycle.refresh` on every relevant coeffect change.
+- It must be compared **by value**, not by reference. `refresh` should compare keys and UID values before deciding whether the target changed.
+- The guard inside `execute` during `reload` reads `fiber.target` at each iteration boundary. Therefore `fiber.target` must be updated by `refresh` even when `fiber.inertia` is non-null.
+
+### 3.9 `committed: Map<Key, number> | null`
+
+- The *actual* resolution under which the fiber is installing or has installed its effects.
+- Set at the beginning of `reload` before any effect iteration runs.
+- Cleared only **after** `fiber.dispose()` has run in `unload`.
+- It is exactly the `ω` of Definition 44, represented as provider UIDs, not values.
+- Important: a proxy access that finds a key in `committed` must resolve the UID to the provider fiber’s value. It must not return the UID itself.
+- Fixity of `committed` during an episode is Theorem 63. The runtime must not clear it while the fiber is `LOADING`, `ACTIVE`, or `UNLOADING` before its own teardown completes.
+
+### 3.10 `dispose: Dispose`
+
+- The accumulator `g`.
+- Initially the identity function.
+- After a successful `execute(...)`, `Lifecycle.reload` composes the returned inverse as:
+  ```
+  fiber.dispose = recover ∘ fiber.dispose
+  ```
+  This yields LIFO recovery: the most recently installed effect is removed first.
+- In `unload`, after dependents have been drained, the runtime calls `await fiber.dispose()`, then resets it to identity.
+- **External code must not call `fiber.dispose()` directly.** It is the internal accumulator, not the public “dispose the fiber” entry point. Calling it while `state === 'ACTIVE'` would uninstall effects but leave state/committed inconsistent. Component teardown should be initiated through `markRetired()` and awaited via `awaitQuiescence()`.
+
+### 3.11 `inertia: Promise<void> | null`
+
+- The handle to the currently executing transition task.
+- Non-null while a `reload` or `unload` is in flight.
+- `refresh` uses it to enforce the inertial model: if a target changes while a transition is running, the target is updated but no new transition is started; the running transition observes the change at its next guard check or completion and chains accordingly.
+- On task completion:
+  - if the fiber reaches a terminal state (`INACTIVE` or `FAILED`), `inertia` becomes `null`;
+  - if the task chains into another transition, `inertia` is replaced with the new task’s promise before the old task returns.
+
+### 3.12 `retired: boolean`
+
+- The retirement flag `τ`.
+- Monotone: `false → true`, never `false` again.
+- Once retired, `computeTarget` must always return `null`, preventing reactivation.
+- `markRetired()` is the canonical way to set this flag.
+- Re-enabling a disabled configuration entry must therefore create a **new** fiber, not un-retire an old one.
+
+### 3.13 `error: unknown | null`
+
+- The per-fiber failure outcome.
+- `null` when no failure has occurred.
+- When set, the fiber should be in `state === 'FAILED'`.
+- Configuration requires `failedFiberTarget: null`, so `computeTarget` must return `null` when `error` is non-null.
+- A failed fiber is still quiescent: `awaitQuiescence()` resolves for `FAILED`.
+- Failure is deliberately not propagated to the parent; siblings keep running.
+
+---
+
+## 4. Method Analysis
+
+### 4.1 `awaitQuiescence(): Promise<void>`
+
+- Resolves when the fiber reaches `INACTIVE` or `FAILED`.
+- This is the runtime form of “no longer installed” used by the guarded withdrawal on `unload`:
+  - provider marks itself `UNLOADING`,
+  - `notify` causes dependents to recompute targets and start unloading,
+  - provider awaits each notified dependent’s `awaitQuiescence()`.
+- Implementation requirements:
+  - If the fiber is already terminal, return an already-resolved promise.
+  - Otherwise register a waiter and resolve it when the fiber transitions to `INACTIVE` or `FAILED`.
+  - Because multiple callers may wait on the same fiber, a private `Set<() => void>` of resolvers is required. This is an internal implementation detail, not a change to the public API.
+- Note: due to the single-source/disjoint-provision discipline, a dependent of a departing provider is always deactivated to `INACTIVE` (target becomes `null`) rather than chaining immediately into a reload. Therefore waiting for `INACTIVE`/`FAILED` is sound. If a replacement provider were allowed to appear before the old provider is gone, the waiter would need a different condition, but that scenario is excluded by the model.
+
+### 4.2 `markRetired(): void`
+
+- Equivalent to `O-Retire`.
+- Should be idempotent:
+  ```
+  if (retired) return
+  retired = true
+  Lifecycle.refresh(this)
+  ```
+- After setting `retired`, `computeTarget` returns `null`, so `refresh` will:
+  - leave an `INACTIVE` fiber alone;
+  - mark an `ACTIVE` fiber `UNLOADING` and schedule `unload`;
+  - update the target of a `LOADING` fiber; the running `reload` will observe the change and divert to unload.
+- `markRetired` is also the correct action for the inverse returned by the `ctx.use` registration callback. Although the design pseudocode for that inverse says `fiber.target = null; unload(fiber)`, it should ultimately delegate to `markRetired()` (or at least set `retired = true`) so that the fiber cannot spontaneously reactivate while its parent is gone.
+
+---
+
+## 5. Lifecycle Interaction and Invariants
+
+### 5.1 State diagram
+
+```
+                 refresh(target != null)
+  INACTIVE ───────────────────────────────► LOADING
+      ▲                                        │
+      │                                        │ execute completes, target unchanged
+      │                                        ▼
+      │                                     ACTIVE
+      │                                        │
+      │                                        │ refresh(target changed)
+      │                                        ▼
+      │                                     UNLOADING
+      │                                        │
+      │                                        │ await dependents, run dispose
+      │                              ┌─────────┴──────────┐
+      │                     target null/retired        target non-null
+      │                              ▼                     ▼
+      │                          INACTIVE               LOADING (chain)
+      │
+      │
+  FAILED ◄─────────────────── error during activation or recovery
+```
+
+A fiber in `LOADING`/`UNLOADING` always has `inertia` non-null. A transition is inertial: once started, it completes before another begins; this is why `refresh` only updates `target` when `inertia` is non-null.
+
+### 5.2 `reload` ordering requirements
+
+1. Capture `target0 = fiber.target`.
+2. Set `committed` to the resolved view.
+3. Run `execute(fiber.apply, () => fiber.target === target0)`.
+4. Compose the returned inverse into `fiber.dispose`.
+5. If target still equals `target0`, enter `ACTIVE` and notify dependents.
+6. Otherwise enter `UNLOADING` and chain into `unload`.
+
+Because `committed` is set before execution, the component’s `apply` can read its declared dependencies through proxy access during activation. The guard at each iteration boundary is what implements Theorem 64 (resolution coherence).
+
+### 5.3 `unload` ordering requirements
+
+1. Ensure `state` is `UNLOADING` **before** notifying dependents. This is the runtime `L-Leave` step. If `unload` is ever called directly from the registration inverse while the fiber is still `ACTIVE`, `unload` must first perform the `ACTIVE → UNLOADING` transition; otherwise dependents would still see the fiber as an active provider and the subsequent dependent-drain would deadlock.
+2. Call `notify(fiber.ctx, providedKeys(fiber))`. Because the fiber is already `UNLOADING`, `computeTarget` for any dependent no longer counts this fiber as a provider, so dependents begin their own teardown.
+3. Await all notified dependents’ `awaitQuiescence()`. This is the guarded withdrawal of Theorem 63.
+4. Run `await fiber.dispose()`.
+5. Reset `fiber.dispose` to identity.
+6. Clear `fiber.committed`.
+7. If `fiber.target === null`, enter `INACTIVE`. Otherwise enter `LOADING` and chain into `reload`.
+
+Keeping `committed` until after `fiber.dispose()` is what allows a dependent to keep reading the departing provider’s value during its own teardown.
+
+### 5.4 Failure handling
+
+- If `execute` raises or an iteration reports an error, the already-accumulated inverses must be applied before marking the fiber failed.
+- After recovery:
+  - `fiber.error = error`
+  - `fiber.state = 'FAILED'`
+  - `fiber.target = null`
+  - `fiber.committed = null`
+  - `fiber.inertia = null`
+- A failed fiber must not be re-entered from `refresh`. This corresponds to `L-Begin` requiring `Inactive(⊥)`.
+
+### 5.5 Key invariants
+
+The `Fiber` class should maintain these invariants (violations should be caught in dev-mode tests):
+
+1. `uid` is unique and never reused.
+2. `parentCtx` and `ctx` are set once; `ctx.parent === parentCtx`; `ctx.fiber === this`.
+3. `inject`, `provide`, `parentCtx`, `uid`, and `ctx` are immutable after construction.
+4. `retired` is monotone `false → true`.
+5. `target` is `null` exactly when the fiber should not run (retired, unsatisfied, or failed). An empty map means “run with no dependencies”.
+6. `committed` is `null` when the fiber is not installed, and non-null while `LOADING`, `ACTIVE`, or `UNLOADING` (until after `dispose` runs).
+7. `dispose` is identity when no effects are installed, and otherwise is reset to identity after `unload`.
+8. `state === 'FAILED'` implies `error !== null`, `target === null`, `committed === null`, and `inertia === null`.
+9. `inertia` is non-null whenever `state` is `LOADING` or `UNLOADING`.
+
+---
+
+## 6. Implementation Considerations
+
+### 6.1 Constructor
+
+The constructor should accept at least:
+
+- `parentCtx`
+- `inject`
+- `provide`
+- `apply`
+
+and initialize:
+
+- `uid` from a module-level counter
+- `ctx = parentCtx.derive()`
+- `ctx.fiber = this`
+- `state = 'INACTIVE'`
+- `target = null`
+- `committed = null`
+- `dispose = () => {}`
+- `inertia = null`
+- `retired = false`
+- `error = null`
+
+The constructor should **not** start any transition. Transitions are started by `Lifecycle.refresh`, which is invoked by `ctx.use` immediately after construction.
+
+### 6.2 Circular dependency handling
+
+`Fiber` depends on `./lifecycle` (for `markRetired`) and `./context` (for the `Context` type). `Lifecycle` depends on `./fiber` to construct fibers. This cycle is safe if:
+
+- `Fiber` imports `Lifecycle` only for use inside method bodies, not at class-definition time;
+- `Lifecycle` imports `Fiber` as a type with `import type` and uses `new Fiber(...)` only inside a method, after both modules have evaluated.
+
+### 6.3 Target equality
+
+`Lifecycle.refresh` must compare `target` by value:
+
+- both `null`, or
+- both non-null, with the same key set and the same provider UID for each key.
+
+Reference equality is insufficient because `refresh` recomputes a new `Map` each time.
+
+### 6.4 Provider lookup
+
+`computeTarget` must resolve each key through the fiber’s own realm table:
+
+```
+realm = fiber.ctx.isolate.get(key) ?? key
+```
+
+and then find an `ACTIVE`, non-retired fiber that provides the same key under the same realm. Under the disjoint-provision discipline, at most one such provider exists.
+
+### 6.5 `awaitQuiescence` wake-up
+
+A private waiter set is needed:
+
+- `_waiters: Set<() => void>`
+- `awaitQuiescence()` adds a resolver if not terminal.
+- `Lifecycle` calls an internal `_settle()` method every time the fiber enters `INACTIVE` or `FAILED`, which resolves all waiters.
+
+This is an internal implementation detail only; it does not alter the listed public API.
+
+### 6.6 Do not expose a public `unload` method
+
+`Fiber` should not expose a public `unload()` method. External code (Loader, HMR) should use `markRetired()` and then `await fiber.awaitQuiescence()`. This ensures that:
+
+- the fiber is properly marked retired;
+- dependents are notified and drained;
+- the accumulator runs exactly once;
+- committed view is cleared at the right time.
+
+Calling `fiber.dispose()` directly from Loader/HMR would bypass these guarantees and corrupt the fiber state.
+
+### 6.7 Registry and `notify`
+
+`Fiber` itself does not contain the registry. `Lifecycle` must maintain a set of live fibers so that `notify` can enumerate fibers affected by a coeffect change. A fiber remains a candidate for notification while it is not retired (or at least while it is still registered). Failed fibers can remain in the registry harmlessly because their target is `null`; retired, unloaded fibers may be pruned by the Loader/HMR.
+
+---
+
+## 7. Edge Cases and Pitfalls
+
+1. **Empty target map vs `null`**  
+   A dependency-free component has `target === new Map()`, not `null`. If code checks `if (target)` it will treat an empty map as truthy and correctly schedule reload; but if code checks `if (target === null)` it must remember that `Map` is an object. Use `target === null` for “do not run”.
+
+2. **Direct `dispose()` call**  
+   As noted, this is unsafe. Tests should not call `fiber.dispose()` externally. If dev-mode assertions are added, calling `dispose` while `state` is not `UNLOADING` should raise an error.
+
+3. **Registration inverse bypassing `refresh`**  
+   The inverse returned by `ctx.use`’s callback should retire the child fiber and schedule its unload in a lifecycle-safe way. The safest implementation is to call `fiber.markRetired()` rather than manually setting `target = null` and invoking `unload`.
+
+4. **Re-enabling a disabled entry**  
+   Since `retired` is monotone, a disabled-then-enabled entry must be realized as a new fiber with a new `uid`. Reusing the old fiber would leave `retired === true` and the fiber would never activate.
+
+5. **Committed view is a UID map, not a value map**  
+   Proxy-mediated access must translate the UID to the provider’s actual value. Returning the UID would leak implementation details and violate the coeffect semantics.
+
+6. **Failure and quiescence**  
+   A failed fiber is considered quiescent for the guard on provider unload. A provider must not wait forever on a failed dependent; `awaitQuiescence` resolving on `FAILED` prevents this.
+
+---
+
+## 8. Summary
+
+`src/fiber.ts` is the runtime embodiment of the formal fiber tuple. Its job is to make the lifecycle engine’s job easy and correct:
+
+- expose stable identity (`uid`),
+- hold the declared interface (`inject`, `provide`),
+- hold the effect function (`apply`),
+- track the accumulator (`dispose`),
+- track desired and actual views (`target`, `committed`),
+- expose lifecycle state (`state`, `inertia`, `retired`, `error`),
+- provide two safe control points (`awaitQuiescence`, `markRetired`).
+
+All policy—when to transition, how to compute targets, how to drain dependents, how to recover on failure—belongs to `src/lifecycle.ts`. `Fiber` is the substrate on which those policies operate, and every field on `Fiber` exists to support exactly one of the formal theorems: recovery exactness, ordering, resolution coherence, progress, or confluence.

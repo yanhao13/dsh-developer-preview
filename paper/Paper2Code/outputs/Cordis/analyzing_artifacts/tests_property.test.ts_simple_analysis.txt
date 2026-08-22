@@ -1,0 +1,255 @@
+# Logic analysis: `tests/property.test.ts`
+
+This analysis defines how the property-based tests in `tests/property.test.ts` should be structured and reasoned about. It follows the formal claims of the paper, the provided design, and the configuration in `config.yaml`. It does not provide final code; it provides the logical skeleton the test implementation must satisfy.
+
+---
+
+## 1. Role of the file
+
+`tests/property.test.ts` validates the runtime’s dynamic-composition guarantees using randomly generated component graphs and orchestration traces. The six properties are direct executable counterparts of the paper’s metatheorems:
+
+1. `recovery_exactness` → Corollary 62 / Theorem 61  
+2. `activation_ordering` → Theorem 63, first claim  
+3. `withdrawal_ordering` → Theorem 63(2) and the unload guard  
+4. `resolution_coherence` → Theorem 64  
+5. `progress` → Theorem 66  
+6. `confluence` → Theorem 73  
+
+The tests should import from `../src` and from helpers exported by `./core.test`, using `fast-check` for property generation and `vitest` as the test runner.
+
+---
+
+## 2. Shared test model
+
+Because the property tests need to reason about UIDs, lifecycle states, and provider relationships that are internal to a running system, the tests should build a small **test harness** around the public design API:
+
+- A `Context` root created with `new Context()`.
+- A `uid -> component id` map, so UIDs can be compared “up to renaming”.
+- A `component id -> Fiber` map for every `ctx.use` call.
+- A `world` object for effects that mutate non-coeffect state; each component owns distinct world slots so effects are pairwise independent.
+- An event log, appended by generated effect inverses, so the tests can observe when a fiber’s effects were actually disposed.
+- A provider index, rebuilt from active fibers and their declared `provide` sets, so tests can answer “which ACTIVE fiber provides this key?” without relying on non-public runtime internals.
+
+A generated component should be represented by a test-only spec:
+
+- `id`: stable component identity.
+- `inject`: declared dependency keys.
+- `provide`: declared provision keys.
+- `steps`: a finite sequence of effects.
+- `apply(ctx, config)`: an effect iterator that installs each effect and yields its inverse.
+
+Every generated component must satisfy the assumptions the paper’s theorems require:
+
+- **Finite iterator length** (`len(e_n) ≤ K`).
+- **Correct inverses**: each inverse undoes exactly the preceding effect.
+- **Pairwise independence**: components write disjoint store keys and disjoint world slots.
+- **Acyclic precedence** (`≺` is acyclic): injection edges only point from earlier-ranked providers to later-ranked dependents.
+- **Total on provision**: if a component becomes ACTIVE, it has installed every key in its `provide` set.
+- **Single-source provision**: no two active fibers provide the same key at the same realm.
+
+---
+
+## 3. Quiescence and equivalence definitions used by all properties
+
+A test state is **quiescent** when:
+
+- No fiber has state `LOADING` or `UNLOADING`.
+- For every fiber:
+  - if `fiber.target` is non-null, then the fiber is `ACTIVE` and `fiber.committed` equals `fiber.target`;
+  - if `fiber.target` is null, then the fiber is `INACTIVE` (or `FAILED`, when failures are under test).
+
+The **observational equivalence** used for comparisons is the paper’s `≃` up to an application-defined equivalence:
+
+- Coeffect values are compared by deep equality by default.
+- A per-key equivalence hook may be supplied when a custom `≃_k` is needed.
+- UIDs are compared only through their component ids.
+- Control fields such as `retired`, `target`, `committed`, and `dispose` are compared only when a property is specifically about them.
+
+The harness’s `settle()` operation should repeatedly await all pending `fiber.inertia` promises and then drain one microtask, until either the state is quiescent or a deadlock is detected. If there is no pending transition and the state is not quiescent, the test must fail: this is the executable form of “some lifecycle rule should apply”.
+
+---
+
+## 4. Property 1: `recovery_exactness`
+
+**Formal basis:**  
+If a fiber `n` is unloaded after other fibers have interleaved effects, the remaining state is exactly the state those other fibers would have produced if `n` had never been loaded, up to `≈`/`≃`.
+
+**Test strategy:**
+
+1. Generate an ambient set of components with disjoint effects.
+2. Generate one target component whose provided keys and world slots are disjoint from all ambient components.
+3. Generate a valid orchestration trace in which the target is loaded once and remains active until the final step.
+4. Run the full trace in harness A; after the last ambient step, retire the target and `settle()`.
+5. Capture the observable state of harness A.
+6. Run the same trace in harness B, but omit the target’s load event; `settle()` and capture the observable state.
+7. Assert the two observable states are equal.
+
+The observable state should include:
+
+- every coeffect binding reachable through `ctx.get(key)` for all generated keys;
+- every world-slot value written by ambient components.
+
+This test is valid because the generated components are pairwise independent, so the order of ambient effects does not need to be commuted manually; the oracle run simply omits the target.
+
+---
+
+## 5. Property 2: `activation_ordering`
+
+**Formal basis:**  
+`L-Begin` is enabled only when `γ ⊧ d_n`, meaning every declared dependency has an ACTIVE provider. Therefore a dependent fiber must never become ACTIVE before its provider.
+
+**Test strategy:**
+
+1. Generate an acyclic dependency graph, e.g., a provider `P` providing `k` and a dependent `D` injecting `k`, optionally extended into a chain.
+2. Generate a random load order that may load dependents before providers.
+3. For each load event, call `load`, then after every microtask checkpoint during `settle()`, assert the activation invariant.
+4. Assert the invariant again after the system is quiescent.
+
+The invariant is:
+
+- If a fiber is `ACTIVE`, then for every `k` in its `inject`:
+  - there exists an `ACTIVE` fiber `p` such that `k ∈ p.provide`;
+  - `fiber.committed.get(k)` equals `p.uid`;
+  - `p.state === 'ACTIVE'`.
+
+A stronger variant should load `D` first and assert that it remains `INACTIVE` until `P` is loaded and becomes `ACTIVE`.
+
+---
+
+## 6. Property 3: `withdrawal_ordering`
+
+**Formal basis:**  
+A provider must not run its inverse while a dependent that resolved a key to it is still ACTIVE. This is the guard implemented by `unload` waiting on notified dependents.
+
+**Test strategy:**
+
+1. Generate a provider `P` and one or more dependents `D1, D2, ...` that have `P` in their committed views.
+2. Load all components to a quiescent ACTIVE state.
+3. Record the dependency edges `(dependent, provider)` from the fibers’ committed views.
+4. Ensure component effect inverses append a `dispose:<component-id>` marker to the shared event log at the moment they run.
+5. Retire the provider, or retire a random subset of fibers that includes the provider, and `settle()` after each retirement.
+6. Assert for every recorded edge:
+   - if the dependent has a dispose event and the provider has a dispose event, then
+   - `index(dependent-dispose-event) < index(provider-dispose-event)`.
+
+An additional in-test assertion can be installed inside the provider’s inverse: when the inverse runs, every fiber whose committed view maps a key to the provider must already have state `INACTIVE` or `FAILED`.
+
+This property should use random graphs with several levels of dependency so that cascaded unloads are exercised.
+
+---
+
+## 7. Property 4: `resolution_coherence`
+
+**Formal basis:**  
+While a fiber is activating, every iteration of its effect iterator runs against the same committed view. If the target changes, the transition either finishes with the old view and then unloads, or diverts/raises before installing further effects.
+
+**Test strategy:**
+
+1. Create a provider `P`.
+2. Create a dependent `D` with an effect iterator of random length `N`.
+3. `D`’s generator should:
+   - record the current `fiber.committed` Map reference and its entries at the start of every iteration;
+   - yield the inverse for that iteration;
+   - then wait on a test-controlled gate before the next iteration begins.
+4. Start the activation of `D`.
+5. After a randomly chosen iteration boundary, trigger one of:
+   - retire `P`;
+   - retire `P`, wait until it is INACTIVE, then load a replacement provider `P'`;
+   - make no change, as a control case.
+6. Release the gate and `settle()`.
+7. Group `D`’s recorded view observations by the identity of the `fiber.committed` Map object. Each group represents one activation episode.
+8. Assert that within each group, every recorded view has exactly the same entries.
+
+The test should also assert that if `D` finishes `ACTIVE`, its final committed view equals its final target; if it finishes `INACTIVE`, no later logs should refer to the old committed view.
+
+This property directly checks the “committed view fixity” required by `config.core.lifecycle.committedViewFixity`.
+
+---
+
+## 8. Property 5: `progress`
+
+**Formal basis:**  
+With acyclic `≺`, finite fiber names, and bounded iterator length, no reachable non-quiescent state is a deadlock, and every maximal sequence of lifecycle steps reaches quiescence.
+
+**Test strategy:**
+
+1. Generate an acyclic component graph and a finite valid orchestration trace.
+2. For every orchestration event, apply it.
+3. For **every** non-quiescent observation point, call `settle()` with a bounded loop.
+4. `settle()` must:
+   - terminate within a finite number of iterations;
+   - after each iteration, either find a pending transition or reach quiescence;
+   - throw if a non-quiescent state has no pending transition.
+5. Assert the final state is quiescent.
+
+To create genuinely non-quiescent concurrent states, the test should sometimes batch multiple load events without settling in between. This forces several inertial transitions to be in flight simultaneously, which is the situation Theorem 66 covers.
+
+Progress should also be tested after random retirements, because a retired fiber whose target becomes `null` must be pulled out of `ACTIVE` by the lifecycle rules.
+
+---
+
+## 9. Property 6: `confluence`
+
+**Formal basis:**  
+Given the same orchestration input, any two schedules reach equivalent quiescent states up to UID renaming and up to the observational equivalence `≃`/`≈`. This requires the generated components to satisfy acyclic `≺`, pairwise independence, and totality on provision.
+
+**Test strategy:**
+
+1. Generate one orchestration input: a fixed set of component specs and a fixed sequence of `load`/`retire` events.
+2. Run this input under two different schedules:
+   - Schedule A: sequential — apply one event, `settle()`, repeat.
+   - Schedule B: batched and/or gated — apply events in chunks without settling, or pause effect iterators at random gates and release them in a randomized order, then `settle()`.
+3. After each schedule reaches quiescence, compute a **normalized state**:
+   - active component ids, sorted;
+   - for each active fiber, its `inject` keys mapped to provider **component ids**, not UIDs;
+   - for each provided key, which component id provides it;
+   - the values in the coeffect store;
+   - the values in the world object.
+4. Assert the two normalized states are equal.
+
+UID renaming is handled by mapping every fiber UID back to its test component id through the harness’s `uid -> component id` table.
+
+This property is the executable analogue of the paper’s claim that dynamic composition converges to the same state as a static assembly.
+
+---
+
+## 10. Random generation rules
+
+The fast-check generators must respect the same hypotheses as the theorems:
+
+- **Dependency graphs** are generated topologically: component `i` may only inject keys provided by components with smaller rank.
+- **Provisions** are disjoint: no two components provide the same key at the same realm.
+- **Effect steps** target disjoint store keys and disjoint world slots, guaranteeing pairwise independence.
+- **Iterator lengths** are bounded by a small constant, representing `K`.
+- **Orchestration traces** are generated by a state machine so that:
+  - `load` only applies to a component that is not currently loaded;
+  - `retire` only applies to a component that is currently loaded and not already retired.
+- Each generated component is total on its provision: if it declares a key in `provide`, its successful activation installs that key.
+
+These rules are not optional; they are the exact preconditions for the metatheorems being tested.
+
+---
+
+## 11. Config alignment
+
+The property tests should reflect the configuration in `config.yaml`:
+
+- Lifecycle states are exactly `INACTIVE`, `LOADING`, `ACTIVE`, `UNLOADING`, `FAILED`.
+- `inertialTransitions: true` is required for resolution coherence and progress: a fiber in flight must not be abruptly restarted by `refresh`.
+- `withdrawalGuard: true` is required for withdrawal ordering: `unload` must await dependents before running the accumulator.
+- `failedFiberTarget: null` is not directly tested in the confluence property because confluence excludes failure, but progress may allow `FAILED` as a terminal state.
+- The synthetic fixture plugin names from `config.tests.syntheticFixturePlugins` — `databaseProvider`, `logger`, `adapter`, `command`, `adminConsole` — should be used as the component ids in the generated graphs whenever a stable, semi-realistic fixture is needed.
+
+---
+
+## 12. Non-goals of this test file
+
+The property tests should **not** attempt to prove:
+
+- The independence condition itself; generated components are assumed independent.
+- Failure confluence; the paper explicitly excludes failure from Theorem 73.
+- HMR transactionality; that belongs in `tests/core.test.ts`.
+- Loader reconciliation details; the `Loader` is exercised in core tests, not in the six property tests.
+- The full formal correctness of the calculus; these are randomized tests, not a proof assistant formalization.
+
+By keeping the property tests inside these boundaries, each failure can be traced either to a violation of a theorem precondition or to a real runtime bug in the lifecycle implementation.

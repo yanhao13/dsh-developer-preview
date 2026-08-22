@@ -1,0 +1,90 @@
+## config.yaml
+project:
+  name: Cordis
+  version: v4
+  language: typescript
+  packageManager: npm
+  scripts:
+    test: vitest run
+    start: tsx main.ts
+  dependencies:
+    typescript: ^5.5.0
+    tsx: ^4.15.0
+    vitest: ^2.0.0
+    fast-check: ^3.20.0
+    "@types/node": ^20.14.0
+
+core:
+  contextSlots:
+    store: "@@store"
+    isolate: "@@isolate"
+    intercept: "@@intercept"
+  effectTracking:
+    executionModel: async-generator
+    inverseComposition: LIFO
+    armedGuard: true
+    guardCheckPerIteration: true
+    disposalIsIdempotent: true
+  coeffect:
+    satisfactionPredicate: all-declared-keys-present
+    notificationTrigger: set-and-remove
+    isolationRealms: true
+    interceptionMetadataMerge: right-biased
+  lifecycle:
+    states: [INACTIVE, LOADING, ACTIVE, UNLOADING, FAILED]
+    inertialTransitions: true
+    committedViewFixity: true
+    withdrawalGuard: true
+    failedFiberTarget: null
+
+loader:
+  reconciliationKey: id
+  fieldDispatch:
+    id: rebuild
+    url: rebuild
+    isolate: patchIsolation
+    intercept: updateInPlace
+    config: componentHandles
+    disabled: unload-or-reload
+  managedRealms:
+    delimiterPerKey: true
+    localRealmTag: entry.id
+    globalRealmTag: named-string
+  groupComponents:
+    - "@cordisjs/group"
+    - "@cordisjs/include"
+
+hmr:
+  classification:
+    seededWith: stashed
+    declinedWith: externals
+    acceptRule: any-import-accepted
+    declineRule: all-imports-declined
+    cycleDefault: declined
+  staleDetection:
+    dependencyBoundary: declined
+    staleRule: dependency-tree-intersects-accepted
+  reload:
+    transactional: true
+    cacheBackup: true
+    cacheRestoreOnError: true
+
+tests:
+  framework: vitest
+  propertyTesting: fast-check
+  properties:
+    recoveryExactness: true
+    activationOrdering: true
+    withdrawalOrdering: true
+    resolutionCoherence: true
+    progress: true
+    confluence: true
+  syntheticFixturePlugins:
+    databaseProvider: true
+    logger: true
+    adapter: true
+    command: true
+    adminConsole: true
+
+training:
+  note: "No training is involved in this paper. The paper presents a programming framework, so no learning rate, batch size, or epochs are specified."

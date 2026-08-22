@@ -1,0 +1,290 @@
+🌟 Usage Summary 🌟
+[Planning] Overall plan
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 84707 (Cost: $0.02287089)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 8372 (Cost: $0.00920920)
+💵 Current total cost: $0.03208009
+🪙 Accumulated total cost so far: $0.03208009
+============================================
+
+🌟 Usage Summary 🌟
+[Planning] Architecture design
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 7342 (Cost: $0.00198234)
+📦 Cached input tokens: 84608 (Cost: $0.00592256)
+📤 Output tokens: 9699 (Cost: $0.01066890)
+💵 Current total cost: $0.01857380
+🪙 Accumulated total cost so far: $0.05065389
+============================================
+
+🌟 Usage Summary 🌟
+[Planning] Logic design
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 2796 (Cost: $0.00075492)
+📦 Cached input tokens: 91904 (Cost: $0.00643328)
+📤 Output tokens: 4280 (Cost: $0.00470800)
+💵 Current total cost: $0.01189620
+🪙 Accumulated total cost so far: $0.06255009
+============================================
+
+🌟 Usage Summary 🌟
+[Planning] Configuration file generation
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 4246 (Cost: $0.00114642)
+📦 Cached input tokens: 94592 (Cost: $0.00662144)
+📤 Output tokens: 1654 (Cost: $0.00181940)
+💵 Current total cost: $0.00958726
+🪙 Accumulated total cost so far: $0.07213735
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] src/types.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 98239 (Cost: $0.02652453)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 22718 (Cost: $0.02498980)
+💵 Current total cost: $0.05151433
+🪙 Accumulated total cost so far: $0.12365168
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] src/types.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 63 (Cost: $0.00001701)
+📦 Cached input tokens: 98176 (Cost: $0.00687232)
+📤 Output tokens: 38928 (Cost: $0.04282080)
+💵 Current total cost: $0.04971013
+🪙 Accumulated total cost so far: $0.12184748
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] src/context.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 6198 (Cost: $0.00167346)
+📦 Cached input tokens: 92032 (Cost: $0.00644224)
+📤 Output tokens: 29441 (Cost: $0.03238510)
+💵 Current total cost: $0.04050080
+🪙 Accumulated total cost so far: $0.16234828
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] src/effect.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 333 (Cost: $0.00008991)
+📦 Cached input tokens: 97792 (Cost: $0.00684544)
+📤 Output tokens: 27822 (Cost: $0.03060420)
+💵 Current total cost: $0.03753955
+🪙 Accumulated total cost so far: $0.19988783
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] src/coeffect.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 399 (Cost: $0.00010773)
+📦 Cached input tokens: 97792 (Cost: $0.00684544)
+📤 Output tokens: 27654 (Cost: $0.03041940)
+💵 Current total cost: $0.03737257
+🪙 Accumulated total cost so far: $0.23726040
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] src/fiber.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 333 (Cost: $0.00008991)
+📦 Cached input tokens: 97792 (Cost: $0.00684544)
+📤 Output tokens: 35269 (Cost: $0.03879590)
+💵 Current total cost: $0.04573125
+🪙 Accumulated total cost so far: $0.28299165
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] src/lifecycle.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 607 (Cost: $0.00016389)
+📦 Cached input tokens: 97792 (Cost: $0.00684544)
+📤 Output tokens: 41956 (Cost: $0.04615160)
+💵 Current total cost: $0.05316093
+🪙 Accumulated total cost so far: $0.33615258
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] src/loader.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 424 (Cost: $0.00011448)
+📦 Cached input tokens: 97792 (Cost: $0.00684544)
+📤 Output tokens: 34822 (Cost: $0.03830420)
+💵 Current total cost: $0.04526412
+🪙 Accumulated total cost so far: $0.38141670
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] src/hmr.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 420 (Cost: $0.00011340)
+📦 Cached input tokens: 97792 (Cost: $0.00684544)
+📤 Output tokens: 22310 (Cost: $0.02454100)
+💵 Current total cost: $0.03149984
+🪙 Accumulated total cost so far: $0.41291654
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] src/index.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 207 (Cost: $0.00005589)
+📦 Cached input tokens: 97792 (Cost: $0.00684544)
+📤 Output tokens: 64543 (Cost: $0.07099730)
+💵 Current total cost: $0.07789863
+🪙 Accumulated total cost so far: $0.49081517
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] tests/core.test.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 297 (Cost: $0.00008019)
+📦 Cached input tokens: 97792 (Cost: $0.00684544)
+📤 Output tokens: 31015 (Cost: $0.03411650)
+💵 Current total cost: $0.04104213
+🪙 Accumulated total cost so far: $0.53185730
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] tests/property.test.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 304 (Cost: $0.00008208)
+📦 Cached input tokens: 97792 (Cost: $0.00684544)
+📤 Output tokens: 28707 (Cost: $0.03157770)
+💵 Current total cost: $0.03850522
+🪙 Accumulated total cost so far: $0.57036252
+============================================
+
+🌟 Usage Summary 🌟
+[ANALYSIS] main.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 246 (Cost: $0.00006642)
+📦 Cached input tokens: 97792 (Cost: $0.00684544)
+📤 Output tokens: 16443 (Cost: $0.01808730)
+💵 Current total cost: $0.02499916
+🪙 Accumulated total cost so far: $0.59536168
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] src/types.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 102750 (Cost: $0.02774250)
+📦 Cached input tokens: 0 (Cost: $0.00000000)
+📤 Output tokens: 3620 (Cost: $0.00398200)
+💵 Current total cost: $0.03172450
+🪙 Accumulated total cost so far: $0.62708618
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] src/context.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 11741 (Cost: $0.00317007)
+📦 Cached input tokens: 91904 (Cost: $0.00643328)
+📤 Output tokens: 6763 (Cost: $0.00743930)
+💵 Current total cost: $0.01704265
+🪙 Accumulated total cost so far: $0.64412883
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] src/effect.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 7052 (Cost: $0.00190404)
+📦 Cached input tokens: 98304 (Cost: $0.00688128)
+📤 Output tokens: 11603 (Cost: $0.01276330)
+💵 Current total cost: $0.02154862
+🪙 Accumulated total cost so far: $0.66567745
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] src/coeffect.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 7502 (Cost: $0.00202554)
+📦 Cached input tokens: 99968 (Cost: $0.00699776)
+📤 Output tokens: 10952 (Cost: $0.01204720)
+💵 Current total cost: $0.02107050
+🪙 Accumulated total cost so far: $0.68674795
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] src/fiber.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 9208 (Cost: $0.00248616)
+📦 Cached input tokens: 102016 (Cost: $0.00714112)
+📤 Output tokens: 10456 (Cost: $0.01150160)
+💵 Current total cost: $0.02112888
+🪙 Accumulated total cost so far: $0.70787683
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] src/lifecycle.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 9290 (Cost: $0.00250830)
+📦 Cached input tokens: 103424 (Cost: $0.00723968)
+📤 Output tokens: 30920 (Cost: $0.03401200)
+💵 Current total cost: $0.04375998
+🪙 Accumulated total cost so far: $0.75163681
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] src/loader.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 12366 (Cost: $0.00333882)
+📦 Cached input tokens: 105472 (Cost: $0.00738304)
+📤 Output tokens: 35832 (Cost: $0.03941520)
+💵 Current total cost: $0.05013706
+🪙 Accumulated total cost so far: $0.80177387
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] src/hmr.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 16471 (Cost: $0.00444717)
+📦 Cached input tokens: 107136 (Cost: $0.00749952)
+📤 Output tokens: 24202 (Cost: $0.02662220)
+💵 Current total cost: $0.03856889
+🪙 Accumulated total cost so far: $0.84034276
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] src/index.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 21383 (Cost: $0.00577341)
+📦 Cached input tokens: 113152 (Cost: $0.00792064)
+📤 Output tokens: 9804 (Cost: $0.01078440)
+💵 Current total cost: $0.02447845
+🪙 Accumulated total cost so far: $0.86482121
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] tests/core.test.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 10614 (Cost: $0.00286578)
+📦 Cached input tokens: 118912 (Cost: $0.00832384)
+📤 Output tokens: 25420 (Cost: $0.02796200)
+💵 Current total cost: $0.03915162
+🪙 Accumulated total cost so far: $0.90397283
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] tests/property.test.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 7680 (Cost: $0.00207360)
+📦 Cached input tokens: 124288 (Cost: $0.00870016)
+📤 Output tokens: 30072 (Cost: $0.03307920)
+💵 Current total cost: $0.04385296
+🪙 Accumulated total cost so far: $0.94782579
+============================================
+
+🌟 Usage Summary 🌟
+[CODING] main.ts
+🛠️ Model: deepseek-v4-flash
+📥 Input tokens: 12709 (Cost: $0.00343143)
+📦 Cached input tokens: 124800 (Cost: $0.00873600)
+📤 Output tokens: 16218 (Cost: $0.01783980)
+💵 Current total cost: $0.03000723
+🪙 Accumulated total cost so far: $0.97783302
+============================================
+

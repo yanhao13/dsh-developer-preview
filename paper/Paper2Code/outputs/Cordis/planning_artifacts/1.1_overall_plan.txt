@@ -1,0 +1,645 @@
+We have a clear mandate: the paper has no public reference implementation, so we must reimplement the Cordis meta-framework and validate the formal claims through property-based tests and a small plugin ecosystem harness. The paper itself contains no numeric benchmark suite; its main evidence is (1) the formal metatheory and (2) the Koishi production case study. Therefore, “reproducing the experiments” means:
+
+1. Rebuilding the runtime machinery exactly enough to satisfy the paper’s stated invariants.
+2. Constructing synthetic and semi-realistic component/plugin scenarios that exercise temporal composability, spatial composability, hot module replacement, and failure recovery.
+3. Where possible, connecting the implementation to a proof-oriented model (or at least a precise executable specification) so the metatheorems can be checked.
+
+Below is a step-by-step reproduction plan.
+
+---
+
+## 1. Guiding Goal and Overall Strategy
+
+We will implement a TypeScript (Node.js) package mirroring the architecture of Cordis:
+
+- **Core library**: `ctx.effect`, `ctx.get`, `ctx.set`, `ctx.isolate`, `ctx.intercept`, fiber lifecycle, reactive refresh, proxy-mediated context access.
+- **Component loader**: declarative configuration entries, reconciliation, managed realms.
+- **Hot module replacement**: module classification, stale-entry detection, transactional reload.
+
+The implementation will be written from scratch, but every algorithm will follow the paper’s pseudocode (Algorithms 1–10) and the formal state machine in Section 4.
+
+Because the paper is a *meta-framework* rather than an end-user application, we also need a deliberately small but realistic plugin suite to validate the system. We will use Koishi-style fixtures: database-provider plugins, message-adapter plugins, middleware plugins, and configuration panels.
+
+---
+
+## 2. Methodology Reconstruction
+
+### 2.1 Formal Core to Reproduce
+
+The paper is built on two symmetric abstractions:
+
+- **Revertible effects** (Section 3.1). Every effect is a context transformation paired with an inverse. The runtime tracks the inverse and composes it onto an accumulator. Key types:
+  - `𝔈Γ = Γ → Γ × (Γ → Γ)`
+  - `𝔈*Γ` adds the witness condition `g(δ) = γ`.
+  - `𝔈iterΓ` supports multi-step effects with a continuation.
+  - `effectΓ` lifts an effect to the `∂Γ` level.
+  - `trackΓ` and `recoverΓ` implement tracking/recovery.
+
+- **Reactive coeffects** (Section 3.2). The context is a finite partial map `Σ = (k : K) ⇀ V k`. Components declare a dependency set `d`. The runtime classifies every domain change as `activating`, `deactivating`, or `neutral`. Additional structure:
+  - `get`, `set` operations.
+  - Isolation realms: `Σiso = (K ⇀ R) × ((r : R) ⇀ V r)`.
+  - Interception metadata: `Σinter = ((k : K) → M k) × ((k : K) ⇀ (M k → V k))`.
+
+- **Unified context** (Section 3.3): `Γ∞ = µΓ. Γ × (Γ → Γ) × Σ`.
+  This is implemented as the `ctx` object carrying:
+  - the current context state,
+  - the accumulated dispose function,
+  - the coeffect store / realm table / interception metadata.
+
+- **Component and fiber model** (Section 4). A component is `(d, p, e)`:
+  - `d`: declared dependencies,
+  - `p`: declared provisions,
+  - `e`: witnessed effect iterator.
+  A fiber adds runtime state:
+  - parent pointer,
+  - local coeffect table,
+  - retirement flag,
+  - lifecycle state `Inactive | Reloading | Active | Unloading`.
+
+- **Lifecycle rules**. The implementation must realize the ten rules:
+  - Orchestration: `O-Insert`, `O-Retire`, `O-Remove`.
+  - Activation: `L-Begin`, `L-Iter`, `L-Finish`.
+  - Deactivation / interruption: `L-Leave`, `L-Unload`, `L-Divert`, `L-Raise`.
+
+- **Target view and quiescence**. Every fiber computes a target view:
+  - `target(γ,n) = ⊥` if retired or dependencies unsatisfied,
+  - otherwise a map from declared keys to provider fiber UIDs.
+  The system is quiescent when every fiber has reached its target.
+
+- **Guarded deactivation**. A fiber cannot run its unload inverse until every fiber that depends on one of its provided keys has deactivated. This is the crucial ordering principle.
+
+### 2.2 Implementation-Level Concepts to Reproduce
+
+We need the following executable counterparts.
+
+| Theory | Runtime (paper name) |
+|---|---|
+| `Γ∞` | `ctx` |
+| `𝔈iterΓ` | callback passed to `ctx.effect` |
+| `effectΓ(e)` | `ctx.effect(callback)` returning `dispose` |
+| `Σ`, `Σiso`, `Σinter` | `ctx[@@store]`, `ctx[@@isolate]`, `ctx[@@intercept]` |
+| `get(k)`, `set(k,v)` | `ctx.get(key)`, `ctx.set(key, value)` |
+| `isolate(k,r)` | `ctx.isolate(key, realm?)` |
+| `intercept(k,ν)` | `ctx.intercept(key, metadata)` |
+| fiber | object returned by `ctx.use(component, config)` |
+| `d`, `p`, `e` | `fiber.inject`, component’s `provide`, `fiber.apply` |
+| accumulator `g` | `fiber.dispose` |
+| committed view `ω` | `fiber.committed` |
+| target view | `fiber.target`, recomputed by `refresh` |
+| `O-Insert`, `O-Retire` | `ctx.use` callback and returned inverse |
+| `L-Begin`, `L-Iter`, `L-Finish` | `reload` task |
+| `L-Leave` | `refresh` marking fiber `UNLOADING` |
+| `L-Unload` | `unload` task with dependent draining |
+| guard on L-Unload | `await all(notify(...))` in `unload` |
+| failure `L-Raise` | fiber state `FAILED`, target set to `⊥` |
+
+---
+
+## 3. Implementation Plan
+
+We will implement Cordis in TypeScript with careful separation:
+
+- `packages/core` — effect/coeffect primitives, fiber lifecycle.
+- `packages/loader` — declarative configuration, reconciliation, managed realms.
+- `packages/hmr` — hot module replacement engine.
+- `packages/test-kit` — synthetic plugin fixtures, property-based testing utilities.
+
+### Phase 0: Executable Specification / Type-Level Model
+
+Before writing runtime code, we will encode the formal model as TypeScript types and a lightweight runtime verifier. This does not prove theorems, but it gives us a precise executable skeleton.
+
+We will define:
+
+```ts
+type Key = string | symbol;
+type Context = any; // loose initial representation
+type EffectIterator = () => AsyncGenerator<Inverse, void, unknown>;
+type Inverse = () => void | Promise<void>;
+type CoeffectSpec = Set<Key>;
+type Provision = Set<Key>;
+```
+
+We will formalize:
+
+- `fiber.state` as a discriminated union matching Section 4.3:
+  - `INACTIVE`
+  - `LOADING`
+  - `ACTIVE`
+  - `UNLOADING`
+  - `FAILED`
+
+- `fiber.committed`: `Map<Key, FiberUID>`.
+- `fiber.target`: `Map<Key, FiberUID> | null`.
+
+We will also add development-only invariant checks:
+
+- A fiber’s `dispose` must run exactly once.
+- `fiber.committed` is constant while `ACTIVE`.
+- A `UNLOADING` fiber provides no keys to new dependents.
+- No two active fibers provide the same realm-resolved key.
+
+### Phase 1: Core Context and Revertible Effects
+
+**Goal:** implement `ctx.effect`.
+
+The paper’s Algorithm 1 is the heart. We will implement:
+
+1. **`execute(callback, guard)`**:
+   - Call `callback()` to obtain an iterator.
+   - Loop:
+     - Check `guard()`; if false, break.
+     - `await iterator.next()`.
+     - If the yielded value is an inverse, compose it onto the accumulator in reverse order (`inverse = yieldedInverse ∘ inverse`).
+     - If `done`, break.
+   - Return the composite inverse.
+
+2. **`effect(ctx, callback)`**:
+   - Create an `armed` flag.
+   - Start `execute(callback, () => armed)`.
+   - `dispose()`:
+     - If not armed, return.
+     - Set `armed = false`.
+     - Wait for the task to resolve.
+     - Call the returned inverse.
+     - Prepend this dispose onto `ctx.dispose`.
+
+Important detail: if the callback is a *plain* function returning a single inverse rather than an iterator, we adapt it to an iterator with one step. This matches the paper’s statement that `ctx.effect` accepts both `𝔈Γ` and `𝔈iterΓ`.
+
+**Tests for Phase 1**:
+- A `ctx.effect` that mutates a value and returns a restoring inverse leaves the context unchanged after `dispose()`.
+- Multiple effects composed sequentially are disposed in LIFO order.
+- A partially executed generator can be interrupted by clearing `armed`; only already-performed steps are undone.
+- A `dispose()` is idempotent.
+
+### Phase 2: Coeffect Store
+
+**Goal:** implement `ctx.get`, `ctx.set`, `ctx.isolate`, `ctx.intercept`.
+
+We will maintain:
+
+- `ctx[@@store]`: a `Map<RealmSymbol, unknown>` from realm symbols to values.
+- `ctx[@@isolate]`: a `Map<Key, RealmSymbol>`.
+- `ctx[@@intercept]`: a `Map<Key, Metadata>`.
+
+#### `ctx.get(key)`
+
+1. Resolve `realm = ctx[@@isolate].get(key)`; if absent, use `key` itself as realm.
+2. Return `ctx[@@store].get(realm)`.
+
+#### `ctx.set(key, value)`
+
+1. Return `ctx.effect(callback)`.
+2. Inside callback:
+   - Resolve realm.
+   - Write `ctx[@@store].set(realm, value)`.
+   - Call `notify(ctx, [key])`.
+   - Return the inverse: delete the store entry and `notify(ctx, [key])` again.
+
+This matches Algorithm 2.
+
+#### `ctx.isolate(key, realm?)`
+
+- If realm not provided, create a fresh `Symbol()`.
+- Derive a child context (or mutate a dedicated child context) so that `@@isolate` maps `key` to the new realm.
+- Since this derives a context rather than mutating the store, no inverse is tracked.
+
+#### `ctx.intercept(key, metadata)`
+
+- Merge metadata into `ctx[@@intercept]` according to the key’s metadata monoid.
+- In TypeScript, we will implement a default “right-biased merge” but allow components to supply a custom merge function.
+
+#### `notify(ctx, keys)` (Algorithm 3)
+
+- For every live fiber:
+  - If the key is in `fiber.inject` and the fiber’s own context resolves that key to the same realm as the changed context, call `refresh(fiber)`.
+- Return the set of fibers that were refreshed.
+
+**Crucial subtlety:** `notify` must be called on the *parent context* of the provider, but a dependent can have an isolated realm. The implementation must compare realms via `fiber.ctx[@@isolate][key]`, not by key equality. We will store `fiber.ctx` as a derived child context.
+
+### Phase 3: Fiber Lifecycle
+
+**Goal:** implement `ctx.use(component, config)` and the lifecycle state machine.
+
+#### Component object
+
+Each component provides:
+
+- `inject`: `readonly Key[]`
+- `provide`: `readonly Key[]` (or derivable from `apply` effects; paper requires explicit)
+- `apply(ctx, config)`: an effect callback or iterator.
+
+#### `ctx.use`
+
+Follow Algorithm 4:
+
+```ts
+function use(ctx, component, config) {
+  const fiber = new Fiber(parentCtx: ctx, inject: component.inject);
+  fiber.ctx = deriveChildContext(ctx, fiber);
+  fiber.apply = () => component.apply(fiber.ctx, config);
+
+  const callback = async () => {
+    refresh(fiber);
+    return () => {
+      fiber.target = null;
+      unload(fiber);
+    };
+  };
+
+  ctx.effect(callback);
+  return fiber;
+}
+```
+
+This makes instantiation a tracked effect of the parent context, enabling cascaded unload.
+
+#### `refresh(fiber)`
+
+Implement `target(γ, n)` per Definition 46:
+
+- If `fiber.retired` or any declared key is not provided by an *Active* fiber, target = `null`.
+- Otherwise, target = `Map<Key, UID>` where each key maps to the UID of the active provider.
+
+Then:
+
+```ts
+function refresh(fiber) {
+  const newTarget = computeTarget(fiber);
+  if (newTarget === fiber.target) return;
+  fiber.target = newTarget;
+
+  if (fiber.inertia) return; // inertial transition in progress
+
+  if (newTarget !== null) {
+    fiber.state = LOADING;
+    fiber.inertia = schedule(reload(fiber));
+  } else {
+    fiber.state = UNLOADING;
+    fiber.inertia = schedule(unload(fiber));
+  }
+}
+```
+
+#### `reload(fiber)`
+
+Per Algorithm 5:
+
+```ts
+async function reload(fiber) {
+  const target0 = fiber.target;
+  fiber.committed = resolve(fiber.inject);
+
+  const recover = await execute(fiber.apply, () => fiber.target === target0);
+  fiber.dispose = compose(recover, fiber.dispose);
+
+  if (fiber.target === target0) {
+    fiber.state = ACTIVE;
+    notify(fiber.ctx, provided(fiber));
+    fiber.inertia = null;
+  } else {
+    fiber.state = UNLOADING;
+    fiber.inertia = schedule(unload(fiber));
+  }
+}
+```
+
+This ensures the fiber only becomes ACTIVE if its resolution did not change during activation.
+
+#### `unload(fiber)`
+
+Per Algorithm 5:
+
+```ts
+async function unload(fiber) {
+  const dependents = notify(fiber.ctx, provided(fiber));
+  await Promise.all(dependents.map(d => d.awaitQuiescence()));
+  await fiber.dispose();
+  fiber.dispose = id;
+  fiber.committed = null;
+
+  if (fiber.target === null) {
+    fiber.state = INACTIVE;
+    fiber.inertia = null;
+  } else {
+    fiber.state = LOADING;
+    fiber.inertia = schedule(reload(fiber));
+  }
+}
+```
+
+**Crucial:** `notify` inside unload must mark dependents as UNLOADING *before* `fiber.dispose` runs. This is the guard from Section 4.3.1.
+
+We will implement `fiber.awaitQuiescence()` as a helper that resolves when the fiber reaches INACTIVE (or FAILED).
+
+#### Error handling
+
+If `execute` throws or the iterator yields a failure, catch it inside `reload`, set a fiber error state:
+
+```ts
+fiber.state = FAILED;
+fiber.target = null;
+fiber.inertia = null;
+```
+
+Tracking is still recovered because the accumulator built so far is applied in an L-Raise-style path.
+
+### Phase 4: Proxy-Mediated Context Access
+
+Per Algorithm 6, `ctx[key]` should resolve against the accessing fiber’s committed view:
+
+- Walk up from `ctx.fiber` through `parent.fiber`.
+- If a fiber’s committed view has `key`, return the bound provider’s value.
+- If a fiber declares `key` but has no committed view, throw `INACTIVE_ACCESS`.
+- If root is reached, throw `UNDECLARED_ACCESS`.
+
+Implementation detail: we need to know which fiber is accessing the context. We will attach a hidden `fiber` property to every derived context, and use a `Proxy` on the context. Components should use `ctx.foo` for declared dependencies; raw `ctx.get` remains available as an escape hatch.
+
+We will also export a function to provision values with proper typing, e.g., `ctx.provide(key, value)` syntactic sugar for `ctx.set`.
+
+### Phase 5: Component Loader and Declarative Configuration
+
+The loader should translate a configuration tree into fiber operations.
+
+#### Configuration entry
+
+```ts
+interface Entry {
+  id: string;
+  url: string;
+  disabled?: boolean;
+  isolate?: boolean | string; // per-key or global?
+  intercept?: Record<string, unknown>;
+  config?: unknown;
+  children?: Entry[]; // for group/include
+}
+```
+
+#### Reconciliation
+
+When an entry changes, apply the least disruptive operation:
+
+- `id` or `url` changed → dispose old fiber, create new fiber.
+- `disabled` set true → retire and unload fiber.
+- `disabled` set false → ensure fiber is loaded.
+- `isolate` changed → patch the realm table and reload only the affected fiber(s).
+- `intercept` changed → mutate metadata; no reload.
+- `config` changed → pass the new config into the component’s `apply`.
+
+For group entries, use keyed diff over child ids and recurse.
+
+#### Managed realms
+
+Implement `patch_isolation(entry, newIsolation)` from Algorithm 7:
+
+- Determine keys whose realm changed.
+- Write a fresh delimiter symbol `δ_k` on the entry’s context.
+- Capture old realm, new realm, entry tag, provider tag.
+- Update `entry.ctx[@@isolate]`.
+- Reload the entry’s fiber.
+- Move the stored binding from old realm to new realm if the entry is the provider (delimiter tags match).
+- Call a specialized `notify` that filters fibers by delimiter tags.
+
+This is one of the trickiest parts because realm scope is dynamic. We will build a small abstract “context derivation tree” to make delimiter inheritance explicit.
+
+### Phase 6: Hot Module Replacement
+
+Implement Algorithms 8, 9, and 10.
+
+#### Module graph
+
+We need an import graph. In Node.js, this can be approximated with static analysis of `import`/`require` statements, or more robustly by hooking the module loader. To stay independent of bundlers, we will implement a simple dependency scanner supporting relative paths and node_modules resolution.
+
+#### Classification
+
+For a set of changed files and external non-replaceable modules:
+
+- Start with `accepted = stashed`, `declined = externals`.
+- Compute transitive imports.
+- Fixed point:
+  - if a pending module imports an accepted module, accept it;
+  - if all its imports are declined, decline it;
+  - otherwise keep pending and add its unseen imports.
+- Default remaining pending modules to declined.
+
+#### Stale entry detection
+
+For every configuration entry, collect transitive dependencies that do not cross declined boundaries. If the tree intersects accepted modules, mark the entry stale and add its whole tree to accepted.
+
+#### Transactional reload
+
+- Clear module caches for accepted modules.
+- Back up the previous component modules.
+- For each stale entry, dispose its fiber and create a new fiber from the freshly imported module.
+- On any error:
+  - restore caches from backup,
+  - dispose all partially replaced fibers,
+  - re-create fibers from backup component modules,
+  - rethrow.
+
+We will implement on Node.js using `require.cache` clearing for CommonJS and an internal `module` registry for ESM; for a pure Vite/Webpack environment, the same logic maps to `import.meta.hot`.
+
+---
+
+## 4. Experimental Validation
+
+### 4.1 Property-Based Test Suite
+
+We will use `fast-check` (or `vitest` + custom property runners) to validate the metatheorems on small random component graphs.
+
+#### Temporal composability
+
+Define an observable context equivalence `≃` for tests:
+
+- Two states are equivalent if:
+  - the coeffect projections bind the same keys;
+  - for each key, values are deep-equal, or equal according to a custom key equivalence.
+
+Property tests:
+
+1. **Recovery exactness**:
+   - Load a fiber.
+   - Run a random interleaving of operations from *other* fibers.
+   - Unload the original fiber.
+   - The resulting state, up to control fields, equals the state that would result from applying the other fibers’ operations alone.
+
+2. **LIFO inverse composition**:
+   - A fiber with many effects yields inverses applied in reverse order.
+
+3. **Interruption rollback**:
+   - A fiber whose apply callback yields multiple iterations is interrupted mid-way (target changes).
+   - Only the already-installed effects are reverted.
+
+#### Spatial composability
+
+1. **Activation ordering**:
+   - A fiber with dependency `k` must not become ACTIVE before a fiber providing `k` is ACTIVE.
+
+2. **Withdrawal ordering**:
+   - When provider of `k` is retired, it must not run its inverse until all fibers with `committed[k] = provider` have reached INACTIVE.
+
+3. **Resolution coherence**:
+   - During a fiber’s transition from INACTIVE to ACTIVE, all iterations are executed against the same committed view.
+
+4. **Replacement**:
+   - Replacing a provider with another provider of the same key causes exactly the dependents to reload; irrelevant fibers do not reload.
+
+#### Progress and Confluence
+
+1. **No deadlock**:
+   - From any non-quiescent state satisfying acyclicity of `≺` (`p_n ∩ d_m` relation), some lifecycle step is applicable.
+
+2. **Termination**:
+   - With finite fibers and bounded iteration lengths, starting from a valid configuration and applying orchestration steps, the system always reaches quiescence.
+
+3. **Confluence**:
+   - Given two different schedules (random orderings of lifecycle steps), the two final states are equivalent:
+     - same active fibers,
+     - same provided values,
+     - same target/committed views up to UID renaming.
+
+### 4.2 Synthetic Plugin Ecosystem
+
+We will construct a mini “Koishi-like” ecosystem with:
+
+- **Database provider plugin** — provides `db` coeffect.
+- **Logger plugin** — provides `logger` coeffect.
+- **Message adapter plugin** — provides `adapter` and depends on `db`, `logger`.
+- **Command plugin** — depends on `adapter`, `db`, `logger`.
+- **Admin console plugin** — depends on `adapter`, `db`; provides `admin`.
+- **HMR test plugin** — a component whose module file is swapped during the test.
+
+This lets us test realistic compositions:
+
+- Startup order: command plugin should wait for adapter and db.
+- Runtime replacement: swap database provider while command plugin is running.
+- Runtime disable: disable command plugin; its effects vanish.
+- Cascaded unload: disable adapter; command plugin and admin console unload first.
+- Full reload via HMR: edit command plugin source; only command plugin reloads, while db and adapter stay alive.
+- Transactional rollback: introduce a syntax error in a changed plugin; HMR restores previous plugin and leaves system running.
+
+### 4.3 Evaluation Metrics
+
+Because the paper does not claim performance superiority, our key metrics are *correctness and structural properties*:
+
+- Number of property tests passed (`0` failures).
+- Proportion of random schedules that reach a quiescent state (`100%` within finite bound).
+- Number of invariant violations (should be `0`).
+- Optional performance benchmarks:
+  - overhead of `ctx.effect` vs direct function call;
+  - memory retained after fiber unload;
+  - time to reload a plugin on HMR;
+  - time to reconcile a large synthetic configuration.
+
+We will not claim to reproduce Koishi’s scale (4000+ plugins), but we will show that the architecture scales to hundreds of synthetic fibers in stress tests.
+
+### 4.4 Formal Verification (Optional but Recommended)
+
+If time permits, we will encode the core definitions in a proof assistant such as Agda, Coq, or Lean:
+
+- effect contexts, twisted composition, `track`, `recover`,
+- witnessed effect functions,
+- reactive coeffect satisfaction,
+- the transition system of Section 4.
+
+This would let us mechanically check the central theorems:
+
+- Theorem 7 (recovery),
+- Theorem 16 (LIFO revert),
+- Theorem 61 (recovery exactness),
+- Theorem 63 (ordering),
+- Theorem 73 (confluence).
+
+A full formalization is heavy, but even a mechanized proof of the core monoid facts (`track` preserves composition, and inverse composition) would greatly increase confidence.
+
+---
+
+## 5. Unclear Points and Assumptions
+
+The paper leaves several details underspecified for a concrete implementation. We will resolve them as follows:
+
+1. **Realm symbols and delimiter semantics**  
+   The paper says `δ_k` is a fresh tag and uses `store[s₁].fiber.ctx[δ_k]` to identify whether a binding “belongs” to an entry. We will implement this by giving every context a chain of delimiter maps. When deriving a child context, delimiters are inherited. A fresh tag is generated for each key on every realm reassignment.
+
+2. **`target(γ, n)` exact computation**  
+   The paper defines it conceptually, but not how to compute providers efficiently. We will maintain a reverse index from `(realm, key) -> fiberUID` for active fibers. `target` for a fiber then queries this index for each declared key.
+
+3. **`provided(fiber)`**  
+   Similarly, we need to know which keys a fiber provides. We will collect this from:
+   - the `provide` set declared by the component, and
+   - a runtime record of keys actually written to `fiber.ctx[@@store]`.
+   The runtime record is safer because a component might not provide everything it declared. We will reconcile both.
+
+4. **Async scheduling model**  
+   The paper’s `create_task` is abstract. In TypeScript, we will use `Promise`-based scheduling, but to make race conditions testable we will expose a `scheduler` abstraction:
+   - `schedule(task)` returns a handle.
+   - `await all(...)` waits for handles.
+   - Tests can force deterministic ordering by controlling the scheduler queue.
+
+5. **Observational equivalence `≃`**  
+   Section 3.3.2 defines state equivalence in terms of application-specific `≃_k`. For a generic TypeScript library, we cannot know the right equivalence for every value type. We will:
+   - Default to `Object.is` / deep equality for plain data.
+   - Allow components to provide a custom `equivalence(key)` hook.
+   - Use this equivalence in tests and in dev-mode invariant checking.
+
+6. **Commutativity checking**  
+   Independence of effects is assumed, not checked. We will implement optional dev-mode warnings when two concurrently active fibers write to the same realm or when a key’s operations are known to be order-sensitive. The system cannot automatically verify commutativity.
+
+7. **HMR module graph**  
+   We will implement a conservative static scanner. For production, this would be replaced by bundler-specific hooks. The paper’s algorithm is generic, but real-world edge cases (dynamic imports, CSS imports, virtual modules) may require configuration.
+
+8. **Type-level dependency declarations**  
+   The paper describes runtime access checking and mentions that a host language could mediate at compile time. Since our target is TypeScript, we can use declaration merging or module augmentation so `ctx.get('db')` is typed when plugins declare their injections. This is peripheral to the formal model, but improves usability.
+
+---
+
+## 6. Suggested Directory / Implementation Order
+
+A practical implementation order:
+
+1. **`packages/core/src/context.ts`**  
+   Basic context object, symbol slots, derived contexts.
+
+2. **`packages/core/src/effect.ts`**  
+   `execute`, `effect`, inverse composition.
+
+3. **`packages/core/src/coeffect.ts`**  
+   `get`, `set`, `notify`, `isolate`, `intercept`.
+
+4. **`packages/core/src/fiber.ts`**  
+   `Fiber` class, `use`, `refresh`, `reload`, `unload`.
+
+5. **`packages/core/src/proxy.ts`**  
+   Proxy-mediated property access.
+
+6. **`packages/core/src/invariants.ts`**  
+   Dev-mode invariant checker.
+
+7. **`packages/loader/src/loader.ts`**  
+   Configuration reconciliation, group/include.
+
+8. **`packages/loader/src/realms.ts`**  
+   Managed realm reassignment.
+
+9. **`packages/hmr/src/classify.ts`, `detect.ts`, `reload.ts`**  
+   HMR engine.
+
+10. **`packages/tests/**`**  
+   Property tests, scenario tests, stress tests.
+
+---
+
+## 7. Final Deliverables
+
+By the end of this reproduction, we should have:
+
+- A working Cordis-compatible core library in TypeScript.
+- A declarative loader with reconciliation and HMR.
+- A robust test suite demonstrating:
+  - temporal composability (clean unload and rollback),
+  - spatial composability (dependency ordering and reactive reload),
+  - progress and confluence (random schedule tests),
+  - transactional HMR.
+- Documentation explaining how each formal definition maps to code.
+- Optional: a proof-of-concept formalization of the core effect algebra.
+
+This plan gives us a direct path from the paper’s formal contributions to an executable, testable implementation. The key is to never lose sight of the paper’s central invariants: complete recovery on unload, dependency-driven activation/deactivation, guarded provider withdrawal, and schedule-independent quiescence.
