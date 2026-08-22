@@ -34,5 +34,4 @@ Status: `tsc --noEmit` clean, **16/16 tests passing** (`vitest` + `fast-check` p
 ---
 
 ## License & attribution
-- Pipeline code: [MIT](LICENSE) (upstream [going-doer/Paper2Code](https://github.com/going-doer/Paper2Code)).
-- The Cordis reproduction was generated with PaperCoder using `deepseek-v4-flash`; the paper itself is by Yifan Shi, Wei Zhang & Tianyi Cui (Peking University / DeepSeek-AI).
+- The Cordis reproduction was generated with Paper2Code; the paper itself is by Yifan Shi, Wei Zhang & Tianyi Cui (Peking University / DeepSeek-AI).
