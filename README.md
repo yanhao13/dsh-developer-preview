@@ -1,3 +1,5 @@
+**Harness Agent using deepseek-v4-pro + max thinking.**
+
 # Code-Change Tracking — 5 Tools Applied to `master@{3day}...master`
 
 **Window resolved:** GitHub's `master@{3day}` = commit `141eb6fe` (2026-08-19T23:11+08:00); `master` = `b150a551` (2026-08-21T20:03+08:00, the dsh-0.1.1-rc.2 release merge).
