@@ -1,0 +1,69 @@
+{
+  "name": "@npm/types",
+  "version": "2.1.0",
+  "description": "Typescript definitions for npm registry content",
+  "types": "./types/index.d.ts",
+  "scripts": {
+    "lint": "npm run eslint",
+    "postlint": "template-oss-check",
+    "template-oss-apply": "template-oss-apply --force",
+    "lintfix": "npm run eslint -- --fix",
+    "snap": "tap",
+    "test": "tap",
+    "posttest": "npm run lint",
+    "eslint": "eslint \"**/*.{js,cjs,ts,mjs,jsx,tsx}\""
+  },
+  "keywords": [
+    "npm registry",
+    "types",
+    "typescript",
+    "definitions",
+    "typings"
+  ],
+  "author": "GitHub Inc.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.6.0"
+  },
+  "devDependencies": {
+    "@npmcli/eslint-config": "^5.0.0",
+    "@npmcli/template-oss": "4.24.3",
+    "@types/node": "22.14.1",
+    "@typescript-eslint/parser": "^8.0.1",
+    "eslint-import-resolver-typescript": "^4.3.2",
+    "tap": "^18.7.3",
+    "typescript": "^5.4.5"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "types/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/npm/types.git"
+  },
+  "templateOSS": {
+    "//@npmcli/template-oss": "This file is partially managed by @npmcli/template-oss. Edits may be overwritten.",
+    "version": "4.24.3",
+    "allowPaths": [
+      "/types/"
+    ],
+    "distPaths": [
+      "types/"
+    ],
+    "latestCiVersion": 18,
+    "windowsCI": false,
+    "macCI": false,
+    "publish": true
+  },
+  "type": "module",
+  "tap": {
+    "typecheck": true,
+    "disable-coverage": true,
+    "show-full-coverage": true
+  },
+  "nyc": {
+    "exclude": []
+  }
+}
