@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-time-context): update package contents",
+  "packageName": "@deepseek-ai/dsh-time-context",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

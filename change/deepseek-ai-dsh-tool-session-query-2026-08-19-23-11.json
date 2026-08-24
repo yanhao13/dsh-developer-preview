@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-tool-session-query): update package contents",
+  "packageName": "@deepseek-ai/dsh-tool-session-query",
+  "email": "cc.yu@deepseek.com"
+}

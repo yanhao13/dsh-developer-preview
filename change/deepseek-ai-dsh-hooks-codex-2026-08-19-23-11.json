@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-hooks-codex): update package contents",
+  "packageName": "@deepseek-ai/dsh-hooks-codex",
+  "email": "cc.yu@deepseek.com"
+}

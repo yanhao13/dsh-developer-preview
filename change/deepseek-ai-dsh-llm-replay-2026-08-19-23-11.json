@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-llm-replay): use unique temp dirs for acp-demo composition persistence",
+  "packageName": "@deepseek-ai/dsh-llm-replay",
+  "email": "cc.yu@deepseek.com"
+}

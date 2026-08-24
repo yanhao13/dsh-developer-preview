@@ -1,0 +1,373 @@
+# Logic Analysis for `main.ts`
+
+## 1. Purpose of `main.ts`
+
+`main.ts` is the executable smoke-test entry point of the Cordis reproduction. It is not a unit test and it is not a benchmark; it demonstrates that the implemented core, loader, and HMR subsystems together exhibit the paper’s central guarantees:
+
+- components activate only when their declared coeffects are satisfied;
+- deactivating a provider causes dependents to deactivate first;
+- unloading a fiber completely removes its effects;
+- HMR can replace a component at runtime and restore it to the ACTIVE state;
+- the system reaches a quiescent state after each orchestration step.
+
+It must be runnable via `npm start` (`tsx main.ts`) and must exit with code `0` when all assertions pass.
+
+---
+
+## 2. Imports and Initialization
+
+`main.ts` should import only from the public API barrel and the type module:
+
+- `Context`, `Loader`, `HMR` from `./src/index`
+- types such as `Component`, `Entry`, `LoadedEntry`, `Fiber` from `./src/types`
+
+The entry point should be an `async function main()` because both the loader reconciliation and the HMR reload are asynchronous. The bottom of the file should call `main()` and set `process.exitCode`:
+
+- `0` on success;
+- `1` if any assertion fails or an exception escapes.
+
+The root context is created with no parent:
+
+```ts
+const root = new Context();
+```
+
+The loader is created over that root context:
+
+```ts
+const loader = new Loader(root);
+```
+
+The HMR engine is stateless enough for a smoke test:
+
+```ts
+const hmr = new HMR();
+```
+
+---
+
+## 3. Component Definitions
+
+The smoke test needs a small Koishi-like plugin graph. The config file lists these fixtures:
+
+- `databaseProvider`
+- `logger`
+- `adapter`
+- `command`
+- `adminConsole`
+
+`main.ts` should therefore define five `Component` objects.
+
+### 3.1 Database provider
+
+- `inject: []`
+- `provide: ['db']`
+- `apply(ctx, config)` calls `ctx.set('db', databaseService)` and returns the disposer returned by `ctx.set`.
+
+This component creates the first dependency value. The inverse removes the `db` binding, which is tracked by the effect engine.
+
+### 3.2 Logger
+
+- `inject: []`
+- `provide: ['logger']`
+- `apply(ctx)` calls `ctx.set('logger', loggerService)`.
+
+It is independent and can activate at any time.
+
+### 3.3 Adapter
+
+- `inject: ['db', 'logger']`
+- `provide: ['adapter']`
+- `apply(ctx)`:
+  1. reads `db` and `logger` via `ctx.get(...)`;
+  2. constructs an adapter service object, e.g. containing a `commands` map;
+  3. calls `ctx.set('adapter', adapterService)`;
+  4. returns the disposer.
+
+This component demonstrates spatial composability: it cannot become ACTIVE until `db` and `logger` exist, even if the loader creates its entry before those providers.
+
+### 3.4 Command plugin
+
+- `inject: ['adapter', 'db', 'logger']`
+- `provide: []`
+- `apply(ctx, config)`:
+  1. reads the adapter service;
+  2. installs a command into `adapter.commands` (a side effect on a provided service);
+  3. returns an inverse that deletes that command.
+
+This is the key temporal-composability case: the command plugin’s only contribution is an external mutation on the adapter object, and that mutation must be reverted on unload.
+
+### 3.5 Admin console
+
+- `inject: ['adapter', 'db']`
+- `provide: ['admin']`
+- `apply(ctx)` reads `adapter` and `db`, then calls `ctx.set('admin', adminService)`.
+
+It both consumes and provides, but no other fixture depends on `admin`, so its unload is simple.
+
+---
+
+##  4. Initial Configuration Tree
+
+The initial `Entry[]` array should deliberately avoid dependency ordering. For example, the command entry can appear before the adapter entry, showing that the runtime, not the loader, is responsible for dependency ordering.
+
+A suitable initial configuration is:
+
+- `command` entry, `disabled: false`;
+- `admin-console` entry;
+- `adapter` entry;
+- `logger` entry;
+- `db` entry.
+
+Each entry has:
+
+- a stable `id`, used as the reconciliation key per `config.yaml` (`loader.reconciliationKey: id`);
+- a `url` pointing to a module that exports a `Component`;
+- a small `config` object, e.g. `{ name: 'hello' }`.
+
+After `await loader.reconcile(entries)`, the loader should have created five fibers. Not all of them are necessarily ACTIVE immediately because activation is reactive and depends on providers.
+
+---
+
+## 5. Waiting for Quiescence
+
+The lifecycle is inertial and asynchronous. `refresh()` schedules `reload()` or `unload()` as a task, but the `refresh()` call itself returns immediately. Therefore `main.ts` must not assume that `await loader.reconcile(...)` already implies a quiescent state.
+
+`main.ts` should define a small local helper:
+
+- `waitForQuiescence(entries: LoadedEntry[]): Promise<void>`
+- It polls all `LoadedEntry.fiber` states.
+- It returns when no fiber is `LOADING` or `UNLOADING`.
+- It throws if a fiber is `FAILED`, unless the test expects failure.
+
+This polling helper is not a public API; it is local to the smoke test. It matches the formal requirement that the system always reaches a quiescent state when the precedence relation is acyclic and iterations are finite.
+
+---
+
+## 6. Printing the Active Fiber Inventory
+
+After each major orchestration step, `main.ts` should print the current inventory.
+
+A local `printInventory(label)` helper should iterate over `loader.entries`, sorted by `id`, and print for each entry:
+
+- the entry `id`;
+- the fiber state (`INACTIVE`, `LOADING`, `ACTIVE`, `UNLOADING`, `FAILED`);
+- the target view, or `⊥`;
+- the committed view, or `⊥`.
+
+This inventory is the smoke test’s primary observable evidence. For example:
+
+- after initial reconciliation, all five fibers should be ACTIVE;
+- after disabling the adapter, command and admin should be INACTIVE while db and logger remain ACTIVE;
+- after HMR reload, command should be ACTIVE again.
+
+---
+
+## 7. Step 6: Disabling the Adapter at Runtime
+
+The task calls for “simulate runtime disable of the adapter; print quiescent state after unload.”
+
+The correct orchestration is to update the adapter entry’s `disabled` field to `true` and call `loader.reconcile` again:
+
+```ts
+adapterEntry.disabled = true;
+await loader.reconcile([...allEntries]);
+await waitForQuiescence(loader.entries);
+printInventory('after adapter disabled');
+```
+
+### Expected lifecycle behavior
+
+1. The loader sees `disabled` changed to `true`.
+2. It marks the adapter fiber retired.
+3. `refresh()` computes a new target `⊥` because the adapter is retired or no longer providing.
+4. The adapter schedules `unload()`.
+5. `unload()` calls `notify(adapter.ctx, ['adapter'])`.
+6. This notification reaches command and admin because both inject `'adapter'`.
+7. Command and admin recompute their target views. Because the adapter is already `UNLOADING`, it is no longer an active provider, so their targets become `⊥`.
+8. Command and admin each schedule `unload()`.
+9. The adapter `unload()` awaits these dependents, which is the guard from Section 4.3.1.
+10. Command and admin run their disposers, become `INACTIVE`.
+11. Only then does the adapter run its disposer and become `INACTIVE`.
+
+This ordering is the central spatial-composability property: a provider must not withdraw its binding until all fibers that committed to that binding have deactivated.
+
+---
+
+## 8. Re-enabling the Adapter Before HMR
+
+The task’s next step is “Simulate HMR reload of the command plugin; verify it reactivates.”
+
+If the adapter remains disabled, the command plugin cannot reactivate because it still injects `'adapter'`. Therefore, before HMR, `main.ts` should re-enable the adapter:
+
+```ts
+adapterEntry.disabled = false;
+await loader.reconcile([...allEntries]);
+await waitForQuiescence(loader.entries);
+```
+
+At this point db, logger, adapter, command, and admin should all be ACTIVE again. This also verifies reactive re-activation.
+
+---
+
+## 9. HMR Reload of the Command Plugin
+
+The HMR stage should exercise the `HMR` class rather than manually replacing the command fiber.
+
+### 9.1 Module URL requirement
+
+`HMR.reload()` in the design imports `entry.url` dynamically. Therefore the command entry’s `url` must point to a real module that exports a `Component`. For a self-contained smoke test, `main.ts` can create a temporary `.mjs` file, write the command plugin source into it, and use `pathToFileURL(...).href` as the command entry’s URL.
+
+If temporary files are undesirable, an alternative is to use an in-memory module registry, but that would extend the design. The file-based approach preserves the design and also exercises cache invalidation through `HMR.invalidateCaches`.
+
+The first version of the command module should export a component with a distinguishing property, e.g. `marker: 'v1'`, and install a command named `hello-v1`. The second version, written before the HMR stage, should have `marker: 'v2'` and install `hello-v2`.
+
+### 9.2 HMR call sequence
+
+The HMR stage should follow the design’s three phases:
+
+1. `classify(stashed, externals)`
+   - `stashed = new Set([commandUrl])`
+   - `externals = new Set()`
+   - The command plugin is isolated, so `classify` returns `accepted = { commandUrl }`.
+
+2. `detectStale(entries, accepted, declined)`
+   - `entries` are the loader’s current `LoadedEntry[]`.
+   - Because the command entry’s dependency tree intersects `accepted`, it is marked stale.
+
+3. `reload(root, accepted, staleEntries)`
+   - It invalidates the command module’s cache.
+   - It backs up the previous component.
+   - It disposes the old command fiber.
+   - It imports the new module.
+   - It creates a fresh command fiber via `ctx.use(...)`.
+   - The new fiber should become ACTIVE because its dependencies are satisfied.
+
+After `await hmr.reload(...)`, `main.ts` should wait for quiescence and assert:
+
+- the new command fiber is ACTIVE;
+- the old command fiber is no longer present in the loader entry;
+- the command registry on the adapter service contains the v2 command, not the v1 command.
+
+This demonstrates temporal composability (the old plugin’s contribution was fully removed) and HMR (the new module was loaded without restarting the process).
+
+---
+
+## 10. Sanity Assertions
+
+`main.ts` should include explicit assertions at each stage. They should be plain `if` checks throwing an `Error` on failure, because the file is a smoke test and should fail loudly.
+
+### 10.1 After initial reconciliation
+
+- All five entries have non-null fibers.
+- All five fibers are ACTIVE after waiting for quiescence.
+- The command fiber’s `committed` view contains `adapter`, `db`, and `logger`.
+- The admin fiber’s `committed` view contains `adapter` and `db`.
+
+This confirms that spatial dependencies were resolved.
+
+### 10.2 After disabling the adapter
+
+- The adapter fiber is INACTIVE.
+- The command fiber is INACTIVE.
+- The admin fiber is INACTIVE.
+- The db and logger fibers are ACTIVE.
+- The command has been removed from the adapter’s command registry (actually the adapter itself is unloaded, so the registry object is no longer available).
+
+This confirms temporal composability of dependent components and guarded withdrawal.
+
+### 10.3 After re-enabling the adapter
+
+- adapter, command, and admin are all ACTIVE again.
+- The command registry contains the command.
+
+This confirms reactive re-activation.
+
+### 10.4 After HMR reload
+
+- The command fiber is ACTIVE.
+- The command fiber’s UID is different from the previous command fiber’s UID.
+- The command registry contains the v2 command and not the v1 command.
+- No fiber is FAILED.
+
+This confirms that the new module was loaded and old effects were fully removed.
+
+---
+
+## 11. Exit Code
+
+The final lines of `main.ts` should be:
+
+```ts
+main()
+  .then(() => {
+    console.log('Smoke test passed');
+    process.exitCode = 0;
+  })
+  .catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+```
+
+This guarantees the process returns `0` only when all stages succeed.
+
+---
+
+## 12. Alignment with `config.yaml`
+
+The behavior of `main.ts` relies on the following configuration settings:
+
+- `core.lifecycle.states`: the smoke test observes `INACTIVE`, `LOADING`, `ACTIVE`, `UNLOADING`, and `FAILED`.
+- `core.lifecycle.inertialTransitions`: the test waits for quiescence instead of assuming immediate state changes.
+- `core.lifecycle.withdrawalGuard`: the adapter disable step depends on dependents deactivating before the provider’s disposer runs.
+- `core.lifecycle.failedFiberTarget`: a failed fiber should never be treated as active; the smoke test checks for FAILED states.
+- `loader.reconciliationKey: id`: the test reuses entry IDs to update existing entries.
+- `loader.fieldDispatch.disabled: unload-or-reload`: disabling the adapter triggers unload, and re-enabling it triggers reload.
+- `hmr.classification.acceptRule: any-import-accepted`: the isolated command module is accepted because it is directly stashed.
+- `hmr.staleDetection.staleRule: dependency-tree-intersects-accepted`: the command entry is stale because its module is in `accepted`.
+- `hmr.reload.transactional: true`: the test expects `HMR.reload` to restore consistency if an import fails.
+
+The smoke test does not require training-related settings because the paper presents a programming framework, not a machine-learning experiment.
+
+---
+
+## 13. Risks and Implementation Notes
+
+### 13.1 Asynchronous lifecycle
+
+The biggest risk in `main.ts` is observing the system before transitions settle. The local `waitForQuiescence` helper is mandatory. In a test environment with eager promise scheduling, a `setTimeout(0)` loop is sufficient. In a lazy environment such as Python-style coroutines, tasks might need explicit spawning; in TypeScript with `tsx`, promises are eager.
+
+### 13.2 `fiber.dispose` semantics
+
+The design distinguishes between:
+
+- the fiber’s accumulated inverse (`fiber.dispose`);
+- the lifecycle transition that retires the fiber and unloads it.
+
+`main.ts` should not call `fiber.dispose()` manually except through the intended lifecycle pathway. The HMR reload stage should rely on `HMR.reload` / `Loader.applyChange`, which must retire the old fiber, drain dependents, run the accumulator, and only then create the new fiber. If the implemented `Fiber.dispose` is only the accumulator, the HMR method must not treat it as a full teardown; it should mark the fiber retired and call `refresh()` first.
+
+### 13.3 HMR module files
+
+The smoke test’s use of temporary `.mjs` files is a pragmatic way to satisfy the design’s `entry.url` requirement. It also exercises Node’s module cache invalidation, which is part of the paper’s transactional HMR design.
+
+If temporary files are not allowed, the alternative is to replace the command component in-memory and call `loader.reconcile` directly, but that would not exercise `HMR.classify`, `detectStale`, or `reload`. The file-based approach is preferred.
+
+### 13.4 `provided(fiber)` tracking
+
+The components in `main.ts` use `ctx.set` to provide keys, so the runtime should be able to observe which keys they wrote. If a component declares `provide: ['adapter']` but the runtime cannot determine that it actually wrote `'adapter'`, the loader should fall back to the declared `provide` set, as specified in the design’s “Anything UNCLEAR” section.
+
+---
+
+## 14. Conclusion
+
+`main.ts` is a compact but complete demonstration of the reproduction’s key claims:
+
+- the context is the single medium for effects and coeffects;
+- fibers activate and deactivate reactively;
+- provider withdrawal is guarded by dependent teardown;
+- unload is complete and does not disturb unrelated components;
+- HMR replaces a module transactionally;
+- the system reaches a deterministic quiescent state after each change.
+
+The smoke test should be kept deterministic: avoid arbitrary timeouts, always wait for quiescence, and assert the exact lifecycle states dictated by the paper’s state machine. If all stages pass, `main.ts` exits with code `0`, providing a clear signal that the reimplemented Cordis core, loader, and HMR subsystems are behaving as specified.

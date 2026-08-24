@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-session-telemetry-otel): keep host state off wire",
+  "packageName": "@deepseek-ai/dsh-session-telemetry-otel",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

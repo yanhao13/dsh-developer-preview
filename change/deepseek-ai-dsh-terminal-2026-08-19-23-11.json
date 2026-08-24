@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-terminal): render the terminal turn error after same-turn retries exhaust",
+  "packageName": "@deepseek-ai/dsh-terminal",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

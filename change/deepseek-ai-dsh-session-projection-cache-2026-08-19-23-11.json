@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-session-projection-cache): keep host state off wire",
+  "packageName": "@deepseek-ai/dsh-session-projection-cache",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

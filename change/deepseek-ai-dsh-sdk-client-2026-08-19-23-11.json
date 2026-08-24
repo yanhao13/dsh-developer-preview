@@ -1,0 +1,7 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-client): structured index injection table and the client boot seams",
+  "packageName": "@deepseek-ai/dsh-sdk-client",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

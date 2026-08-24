@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-ui-skill): align turn-error prose with exhausted-retry rendering",
+  "packageName": "@deepseek-ai/dsh-client-ui-skill",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

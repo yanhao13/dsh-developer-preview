@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-tool-subagent): rethrow accumulated cleanup errors; register fresh handle",
+  "packageName": "@deepseek-ai/dsh-tool-subagent",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

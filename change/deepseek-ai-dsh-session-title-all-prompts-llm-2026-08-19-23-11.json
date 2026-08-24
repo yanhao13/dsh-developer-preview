@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-session-title-all-prompts-llm): keep host state off wire",
+  "packageName": "@deepseek-ai/dsh-session-title-all-prompts-llm",
+  "email": "cc.yu@deepseek.com"
+}

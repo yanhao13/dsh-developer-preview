@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-generator): update package contents",
+  "packageName": "@deepseek-ai/dsh-typert-generator",
+  "email": "cc.yu@deepseek.com"
+}

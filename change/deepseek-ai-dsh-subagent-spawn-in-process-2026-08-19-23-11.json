@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-subagent-spawn-in-process): rethrow accumulated cleanup errors; register fresh handle",
+  "packageName": "@deepseek-ai/dsh-subagent-spawn-in-process",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

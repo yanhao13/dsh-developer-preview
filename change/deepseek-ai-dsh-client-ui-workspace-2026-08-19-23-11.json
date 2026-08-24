@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-ui-workspace): promote new sessions only once",
+  "packageName": "@deepseek-ai/dsh-client-ui-workspace",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

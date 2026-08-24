@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-compaction-basic): update package contents",
+  "packageName": "@deepseek-ai/dsh-compaction-basic",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

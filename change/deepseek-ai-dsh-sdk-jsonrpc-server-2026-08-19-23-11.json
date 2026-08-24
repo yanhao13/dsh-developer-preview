@@ -1,0 +1,6 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-server): structured index injection table and the client boot seams",
+  "packageName": "@deepseek-ai/dsh-sdk-jsonrpc-server",
+  "email": "cc.yu@deepseek.com"
+}

@@ -1,0 +1,7 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-authorization): upgrade the pre-release flat document at boot",
+  "packageName": "@deepseek-ai/dsh-authorization",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

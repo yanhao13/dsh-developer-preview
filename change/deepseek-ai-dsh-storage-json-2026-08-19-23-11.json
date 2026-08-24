@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-storage-json): update package contents",
+  "packageName": "@deepseek-ai/dsh-storage-json",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

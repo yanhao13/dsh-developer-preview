@@ -1,0 +1,373 @@
+# Logic Analysis for `tests/core.test.ts`
+
+This document provides the logic analysis for the Vitest core-semantics test file. It does **not** contain the final implementation code; it is the reasoning that should drive the writing of `tests/core.test.ts`.
+
+---
+
+## 1. Role of the file
+
+`tests/core.test.ts` is the primary unit-test suite for the reimplemented Cordis core. It validates:
+
+- revertible effect tracking and LIFO inverse composition,
+- the coeffect store and its operations,
+- isolation and interception semantics,
+- the inertial fiber lifecycle,
+- guarded withdrawal,
+- failure recovery,
+- the declarative loader,
+- transactional hot module replacement.
+
+It imports the public API from `../src` and uses Vitest assertions. Additional Node builtins are used only in the loader/HMR tests to create temporary module fixtures.
+
+---
+
+## 2. Shared test assumptions and harness
+
+Several behaviors are needed across the test cases.
+
+### 2.1 Asynchronous lifecycle and effect execution
+
+Effects are modeled with async iterators (`EffectCallback`). `ctx.effect` starts an `execute` task; fibers schedule `reload`/`unload` tasks and store the handle in `fiber.inertia`. Tests therefore need a small async helper, e.g.:
+
+- `flushAsync()`: advances the microtask queue enough for scheduled lifecycle steps and effect iterations to run.
+- `waitForState(fiber, state)`: uses `vi.waitFor` to wait until `fiber.state` reaches the expected value.
+
+Assertions should never assume that a lifecycle transition is synchronous.
+
+### 2.2 Fiber quiescence
+
+`fiber.awaitQuiescence()` resolves when the fiber reaches `INACTIVE` or `FAILED`. This is used directly by the lifecycle guard, and tests can use it to wait for deactivation. However, to wait for activation, tests should wait for `state === 'ACTIVE'` rather than `awaitQuiescence`, since an `ACTIVE` fiber does not resolve that promise until it later deactivates.
+
+### 2.3 Context and fiber relationship
+
+A fiber owns a derived child context (`fiber.ctx`). Effects performed through that context, including `ctx.set`, are tracked in the fiber’s accumulator. The test suite relies on the design’s invariant that `fiber.dispose` is the accumulator through which all effects on `fiber.ctx` are recovered.
+
+### 2.4 Temporary modules
+
+The loader and HMR tests need real importable module URLs. The tests will create temporary `.mjs` or `.cjs` files under a temporary directory, convert them to file URLs, and clean them up after the tests. `.cjs` is preferable for the HMR rollback test because Node’s `require.cache` can be cleared deterministically.
+
+---
+
+## 3. Test-by-test analysis
+
+### 3.1 Test 1: `ctx.effect` disposes in LIFO order
+
+**Purpose:** Validate Algorithm 1, specifically that the runtime composes yielded inverses in last-in-first-out order.
+
+**Logical setup:**
+
+1. Create a root `Context`.
+2. Maintain a shared `events` array.
+3. Register one effect whose callback is an async generator:
+   - First step logs `"apply1"` and yields an inverse that logs `"inverse1"`.
+   - Second step logs `"apply2"` and yields an inverse that logs `"inverse2"`.
+4. Let the effect task run until both steps have been applied.
+5. Call the returned `dispose()` and await it.
+6. Call `dispose()` a second time to validate idempotence.
+
+**Expected result:**
+
+- `events` after disposal is `["apply1", "apply2", "inverse2", "inverse1"]`.
+- The second disposal does not throw and does not change `events`.
+
+**Reasoning:** `EffectEngine.execute` maintains an accumulator `inverse = value ∘ inverse`. The most recently yielded inverse therefore executes first when the composite inverse is invoked.
+
+**Config mapping:** `core.effectTracking.inverseComposition: LIFO`, `core.effectTracking.disposalIsIdempotent: true`.
+
+---
+
+### 3.2 Test 2: `ctx.set` installs and removes a binding
+
+**Purpose:** Validate `ctx.set` as a revertible coeffect provision (Algorithm 2).
+
+**Logical setup:**
+
+1. Create a root `Context`.
+2. Call `const dispose = ctx.set('db', { ready: true })`.
+3. Wait until `ctx.get('db')` returns the value.
+4. Call `await dispose()`.
+5. Assert `ctx.get('db')` is `undefined`.
+6. Call `await dispose()` again to confirm idempotence.
+
+**Expected result:**
+
+- Before disposal, the binding is visible.
+- After disposal, the binding is gone.
+- Double disposal is harmless.
+
+**Reasoning:** `ctx.set` is implemented as `ctx.effect(callback)`. The effect callback writes into the realm-resolved store slot and notifies dependents; its inverse deletes the store slot and notifies again. Disposal idempotence comes from the `armed` flag in `EffectEngine.effect`.
+
+**Config mapping:** `core.coeffect.notificationTrigger: set-and-remove`, `core.effectTracking.disposalIsIdempotent: true`.
+
+---
+
+### 3.3 Test 3: `ctx.isolate` creates independent bindings for the same logical key
+
+**Purpose:** Validate coeffect isolation (Definition 28/29).
+
+**Logical setup:**
+
+1. Create a root `Context`.
+2. Set a root-level binding for key `'db'`.
+3. Derive two child contexts:
+   - `ctxA = ctx.isolate('db', realmA)`.
+   - `ctxB = ctx.isolate('db', realmB)`.
+4. Set different values for `'db'` on `ctxA` and `ctxB`.
+5. Assert that each context sees its own value, and that the root still sees the root value.
+
+**Expected result:**
+
+- `ctx.get('db')` remains the root value.
+- `ctxA.get('db')` is the value set on `ctxA`.
+- `ctxB.get('db')` is the value set on `ctxB`.
+
+**Reasoning:** `isolate` derives a new context whose realm table maps `'db'` to a different realm symbol. Because `set` writes into the realm-resolved store slot, derived contexts write to different slots even though they logically share the same key.
+
+**Config mapping:** `core.coeffect.isolationRealms: true`.
+
+---
+
+### 3.4 Test 4: `ctx.intercept` merges metadata and affects `ctx.get` via provider function
+
+**Purpose:** Validate coeffect interception (Definition 30/31). In this implementation, a stored coeffect may be a provider function `(metadata) => value`; `ctx.get` must apply the context-carried interception metadata to it.
+
+**Logical setup:**
+
+1. Create a root `Context`.
+2. Store a provider function under key `'svc'`:
+   - `ctx.set('svc', (meta) => ({ level: meta.level }))`.
+3. Derive an intercepted child context:
+   - `const child = ctx.intercept('svc', { level: 7 })`.
+4. Assert `child.get('svc')` returns `{ level: 7 }`.
+5. Assert the root context is not mutated by the interception.
+
+**Expected result:**
+
+- The derived context’s metadata is merged on access.
+- The provider function receives the merged metadata.
+- The root context still sees either the raw function or the provider applied to empty metadata; the important assertion is that interception is local to the derived context.
+
+**Reasoning:** Interception is a derived realization, not an in-place effect. It adjusts how a binding is read without changing the underlying store. A provider function is the natural value type that lets metadata influence the returned dependency.
+
+**Config mapping:** `core.coeffect.interceptionMetadataMerge: right-biased`.
+
+---
+
+### 3.5 Test 5: Fiber starts `INACTIVE`, becomes `ACTIVE` when dependencies are provided
+
+**Purpose:** Validate reactive coeffect activation and the `L-Begin`/`L-Iter`/`L-Finish` path.
+
+**Logical setup:**
+
+1. Define a dependency-free provider component:
+   - `inject: []`, `provide: ['db']`.
+   - `apply(ctx, config)` returns an effect callback that calls `ctx.set('db', value)` and returns a no-op inverse.
+2. Define a consumer component:
+   - `inject: ['db']`, `provide: []`.
+   - `apply(ctx, config)` returns an effect callback that reads `ctx.get('db')` and returns a no-op inverse.
+3. Create the consumer fiber first.
+4. Wait until the consumer reaches `INACTIVE`.
+5. Create the provider fiber.
+6. Wait until the provider reaches `ACTIVE`.
+7. Wait until the consumer reaches `ACTIVE`.
+8. Assert that the consumer’s `committed` view maps `'db'` to the provider’s UID.
+
+**Expected result:**
+
+- The consumer does not activate while `'db'` is absent.
+- Once the provider is active, `ctx.set('db', ...)` notifies the consumer.
+- The consumer recomputes its target, starts a reload, commits the view, and becomes `ACTIVE`.
+
+**Reasoning:** `notify` iterates live fibers and, for fibers declaring the changed key, calls `refresh`. The consumer’s target changes from `null` to a map containing the provider UID, so the lifecycle schedules `reload`.
+
+**Config mapping:** `core.coeffect.satisfactionPredicate: all-declared-keys-present`, `core.lifecycle.inertialTransitions: true`.
+
+---
+
+### 3.6 Test 6: Fiber becomes `INACTIVE` when a provider is retired
+
+**Purpose:** Validate deactivation through `O-Retire` semantics, `L-Leave`, and `L-Unload`.
+
+**Logical setup:**
+
+1. Build the same provider/consumer pair as in Test 5, and wait until both are `ACTIVE`.
+2. Call `provider.markRetired()`.
+3. Wait until the consumer reaches `INACTIVE`.
+4. Wait until the provider reaches `INACTIVE`.
+5. Assert `ctx.get('db')` is `undefined`.
+
+**Expected result:**
+
+- The consumer deactivates because its declared key is no longer provided by an active fiber.
+- The provider deactivates only after the consumer has stopped relying on it.
+- The binding installed by the provider is recovered.
+
+**Reasoning:** `markRetired()` sets `retired = true` and calls `refresh`. The provider’s target becomes `null`, so it starts `unload`. `unload` first calls `notify` with the provider’s keys; the consumer’s target also becomes `null` and starts its own unload. The provider then waits for the consumer’s `awaitQuiescence()` before running its own accumulator.
+
+**Config mapping:** `core.lifecycle.withdrawalGuard: true`, `core.lifecycle.failedFiberTarget: null`.
+
+---
+
+### 3.7 Test 7: Guarded unload: dependents deactivate before provider’s dispose runs
+
+**Purpose:** Validate the guard on `L-Unload` from Section 4.3.1: a provider may not run its inverse while a dependent still resolves one of its keys.
+
+**Logical setup:**
+
+1. Define a provider component whose effect registers:
+   - `ctx.set('db', ...)` for the dependency,
+   - an explicit `ctx.effect` whose inverse logs `"provider-cleanup"`.
+2. Define a consumer component whose effect registers an explicit `ctx.effect` whose inverse logs `"consumer-cleanup"`.
+3. Activate both fibers.
+4. Call `provider.markRetired()`.
+5. Wait until the provider reaches `INACTIVE`.
+6. Assert the shared log contains `"consumer-cleanup"` before `"provider-cleanup"`.
+
+**Expected result:**
+
+- The consumer’s teardown inverse runs before the provider’s teardown inverse.
+- The provider’s accumulator is not invoked while the consumer is still `ACTIVE`.
+
+**Reasoning:** In `unload`, the provider first notifies dependents and awaits their `awaitQuiescence()`. Because the consumer’s target becomes `null`, the consumer deactivates; only after the consumer reaches `INACTIVE` does the provider call `fiber.dispose()`.
+
+**Config mapping:** `core.lifecycle.withdrawalGuard: true`.
+
+---
+
+### 3.8 Test 8: Failure during activation leaves fiber `FAILED` and context recovered
+
+**Purpose:** Validate `L-Raise` and `L-Unload` after a failed activation.
+
+**Logical setup:**
+
+1. Define a failing component:
+   - `inject: []`, `provide: ['db']`.
+   - `apply(ctx)` returns an effect callback that first calls `ctx.set('db', 'partial')`, then throws an `Error`.
+2. Create the fiber.
+3. Wait until the fiber reaches `FAILED`.
+4. Assert:
+   - `fiber.error` is the thrown `Error`.
+   - `fiber.target` is `null`.
+   - `fiber.committed` is `null`.
+   - `ctx.get('db')` is `undefined`.
+
+**Expected result:**
+
+- The partial effect installed by `ctx.set` is recovered.
+- The fiber does not remain `ACTIVE` or `LOADING`.
+- No binding is left behind.
+
+**Reasoning:** An activation failure routes through the same unload machinery: the accumulator built so far is applied, the committed view is discarded, and the fiber records the error outcome. In the implementation, the `FAILED` state corresponds to the paper’s `INACTIVE(ξ)`.
+
+**Config mapping:** `core.lifecycle.states` includes `FAILED`, `core.lifecycle.failedFiberTarget: null`.
+
+---
+
+### 3.9 Test 9: Loader reconciliation creates/removes/updates fibers by id
+
+**Purpose:** Validate Section 5.2.1: the loader reconciles declarative entries by stable `id`.
+
+**Logical setup:**
+
+1. Create a root `Context` and a `Loader`.
+2. Create temporary module files:
+   - `db.mjs` exporting a database provider component.
+   - `cmd.mjs` exporting a command component that injects `'db'`.
+   - `admin.mjs` exporting an admin component.
+3. Reconcile the loader with:
+   - `db` entry,
+   - `cmd` entry.
+4. Wait until both entries have active fibers.
+5. Record the `db` fiber’s UID.
+6. Reconcile the loader with:
+   - `db` entry with an updated `config`,
+   - `admin` entry,
+   - no `cmd` entry.
+7. Wait for reconciliation to settle.
+
+**Expected result:**
+
+- `loader.entries.get('db')` still exists and its fiber UID is unchanged (config updates do not rebuild the fiber).
+- `loader.entries.has('cmd')` is `false`.
+- A fiber was created for `admin`.
+- The removed `cmd` fiber reaches `INACTIVE`.
+
+**Reasoning:** `reconcile` computes a keyed diff by `id`. Additions are instantiated with `ctx.use`, removals retire and dispose the old fiber, and updates dispatch on the changed field. An `id`/`url` change triggers a rebuild; a `config` change is handed to the component.
+
+**Config mapping:** `loader.reconciliationKey: id`, `loader.fieldDispatch.config: componentHandles`.
+
+---
+
+### 3.10 Test 10: HMR transactional reload rolls back on syntax error
+
+**Purpose:** Validate Algorithm 10: if any stale module fails to import, the system restores caches and rebuilds the stale entries from backup.
+
+**Logical setup:**
+
+1. Create a root `Context` and `Loader`.
+2. Create temporary CommonJS module files:
+   - `db.cjs`: a provider component.
+   - `cmd.cjs`: a command component injecting `'db'`.
+3. Reconcile the loader with both entries.
+4. Wait until both are `ACTIVE`.
+5. Overwrite `cmd.cjs` with intentionally invalid JavaScript.
+6. Create an `HMR` instance.
+7. Call:
+   - `classify(new Set([cmdUrl]), new Set())`
+   - `detectStale([...loader.entries.values()], accepted, declined)`
+   - `reload(loader.context, accepted, staleEntries)`
+8. Expect `reload` to reject.
+9. After the rejection:
+   - Assert `loader.entries.get('cmd')!.fiber` exists and is `ACTIVE`.
+   - Assert the restored command component is the old, working version.
+   - Assert the `db` fiber was not rebuilt and remains `ACTIVE`.
+
+**Expected result:**
+
+- The transaction rolls back completely.
+- The system does not remain half-reloaded.
+- The old command component is usable again.
+
+**Reasoning:** `invalidateCaches` backs up the old module exports before clearing the cache. If the fresh import of a stale entry throws, the catch block restores the cache and rebuilds every stale entry from `backup[entry.url]` — the previous component object — rather than from the broken source file.
+
+**Config mapping:** `hmr.reload.transactional: true`, `hmr.reload.cacheRestoreOnError: true`.
+
+---
+
+## 4. Key implementation details the tests depend on
+
+### 4.1 `Context.get` and provider functions
+
+Test 4 requires that `ctx.get(key)` checks whether the stored value is a function. If it is a function, it is treated as a provider `ψ(metadata)`, and it is invoked with the merged interception metadata. This behavior is not explicit in the design’s simplified signature but is required by the paper’s `Σinter` semantics.
+
+### 4.2 `fiber.dispose` and `fiber.ctx.dispose`
+
+Tests 7 and 8 depend on the fiber accumulator including effects installed through `fiber.ctx`, such as `ctx.set` and `ctx.effect`. The tests assume `fiber.dispose` is the accumulator for all effects performed on `fiber.ctx`.
+
+### 4.3 `notify` and dependent draining
+
+The guarded-withdrawal test depends on `unload` calling `notify` **before** invoking `fiber.dispose`. If a provider unload merely ran its accumulator without notifying dependents, the consumer would remain active and the ordering assertion would fail.
+
+### 4.4 Loader module loading
+
+The loader must support importing a component from a file URL. The temporary fixture modules should be written before `reconcile` is called. Removing an entry must dispose the old fiber and delete it from `loader.entries`.
+
+### 4.5 HMR cache invalidation
+
+For deterministic cache eviction, the HMR rollback test should use `.cjs` fixtures. `invalidateCaches` should remove the corresponding entries from `require.cache` and record the old `module.exports` objects as backups. Restoring caches reinserts those exports.
+
+---
+
+## 5. Summary
+
+`tests/core.test.ts` exercises the essential runtime guarantees that make Cordis a spatiotemporal composability framework:
+
+- effects are truly revertible,
+- coeffects are reactive and context-aware,
+- fibers activate and deactivate in dependency order,
+- provider withdrawal is guarded,
+- failures do not leak partial effects,
+- declarative configuration reconciles safely,
+- HMR rolls back atomically.
+
+The test file should be written so that every assertion follows directly from the paper’s algorithms and the provided design, while remaining independent of implementation details such as exact scheduling, realm symbol generation, and module cache internals.

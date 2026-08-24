@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-code-runtime-python): update package contents",
+  "packageName": "@deepseek-ai/dsh-code-runtime-python",
+  "email": "cc.yu@deepseek.com"
+}

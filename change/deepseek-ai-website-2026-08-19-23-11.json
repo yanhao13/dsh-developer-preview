@@ -1,0 +1,6 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-website): expand source upload envelope",
+  "packageName": "@deepseek-ai/website",
+  "email": "agents@deepseek-ai.dev"
+}

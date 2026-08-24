@@ -1,0 +1,4 @@
+Chunk info (500 lines per chunk, total diff lines: 81639):
+  chunks: 164
+  chunk 1: lines 1-500
+  chunk N: lines 81501-81639

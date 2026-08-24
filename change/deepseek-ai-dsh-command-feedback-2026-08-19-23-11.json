@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-command-feedback): update package contents",
+  "packageName": "@deepseek-ai/dsh-command-feedback",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

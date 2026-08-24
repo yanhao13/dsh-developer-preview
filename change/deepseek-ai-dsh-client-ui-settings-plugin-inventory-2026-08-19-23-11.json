@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-ui-settings-plugin-inventory): align turn-error prose with exhausted-retry rendering",
+  "packageName": "@deepseek-ai/dsh-client-ui-settings-plugin-inventory",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

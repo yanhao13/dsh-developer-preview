@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-ui-workflow-run): align turn-error prose with exhausted-retry rendering",
+  "packageName": "@deepseek-ai/dsh-client-ui-workflow-run",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

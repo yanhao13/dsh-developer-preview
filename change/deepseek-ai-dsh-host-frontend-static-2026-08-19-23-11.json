@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-frontend-static): return 404 for a missing index",
+  "packageName": "@deepseek-ai/dsh-host-frontend-static",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

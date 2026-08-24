@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-tool-terminal): update package contents",
+  "packageName": "@deepseek-ai/dsh-tool-terminal",
+  "email": "cc.yu@deepseek.com"
+}

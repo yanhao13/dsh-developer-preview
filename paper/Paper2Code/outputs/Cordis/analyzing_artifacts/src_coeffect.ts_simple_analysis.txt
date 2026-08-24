@@ -1,0 +1,319 @@
+# Logic Analysis: `src/coeffect.ts`
+
+## 1. Role in the Paper and the Reproduction
+
+`coeffect.ts` implements the **reactive coeffect** layer of the paper:
+
+- It realizes the coeffect context `Σ` and its isolated/intercepted variants (`Σiso`, `Σinter`) as operations on the first-class `Context`.
+- It implements Algorithm 2 (`ctx.set`, `ctx.get`) and Algorithm 3 (`notify`).
+- It is the bridge between *spatial dependency changes* and the *fiber lifecycle*: whenever a binding is installed or removed, `notify` re-evaluates every fiber whose declared dependency set is affected.
+- It also provides `intercept`, the runtime form of coeffect interception from Definition 31.
+
+Per `config.yaml`, the relevant settings are:
+
+- `core.coeffect.satisfactionPredicate: all-declared-keys-present`
+- `core.coeffect.notificationTrigger: set-and-remove`
+- `core.coeffect.isolationRealms: true`
+- `core.coeffect.interceptionMetadataMerge: right-biased`
+- `core.contextSlots: @@store / @@isolate / @@intercept`
+
+The module must not implement the whole lifecycle; it only **triggers** refresh through the lifecycle. The actual activation/deactivation transitions belong to `lifecycle.ts`.
+
+---
+
+## 2. Critical Implementation Decisions
+
+### 2.1 Access to “private” context slots
+
+The design says `Context` has private `store`, `isolate`, `intercept` maps, but `coeffect.ts` is a separate module that must read and write them. TypeScript `private` would prevent this.
+
+**Resolution:** Represent the slots with exported unique symbols, following the paper’s notation `ctx[@@store]`, `ctx[@@isolate]`, `ctx[@@intercept]`:
+
+- Define and export from `context.ts` (or an internal module) three symbols:
+
+  ```ts
+  export const STORE: unique symbol = Symbol('@@store');
+  export const ISOLATE: unique symbol = Symbol('@@isolate');
+  export const INTERCEPT: unique symbol = Symbol('@@intercept');
+  ```
+
+- `Context` stores its internal maps under these symbol-keyed properties.
+- `coeffect.ts` imports these symbols and accesses the slots as `ctx[STORE]`, `ctx[ISOLATE]`, `ctx[INTERCEPT]`.
+
+This keeps the slots hidden from the normal public API while allowing the coeffect module to implement the operations, and it mirrors the paper’s symbol-keyed access exactly.
+
+### 2.2 Realm inheritance vs. copying
+
+`ctx.isolate(key, realm)` must return a derived context in which the key resolves to a new realm, without mutating the original context. The loader’s managed-realm algorithm (`patchIsolation`) also mutates an entry context’s `@@isolate` table and expects descendant contexts to observe the change.
+
+Therefore, a naive `new Map(parent[ISOLATE])` copy is **not** sufficient: it would freeze the realm table at derivation time and break the context-tree inheritance that Algorithm 7 relies on.
+
+**Resolution:**
+
+- `store`: share the same `Map<Realm, any>` object across derived contexts. All contexts in one root tree see the same bindings, which is necessary for dependency visibility.
+- `isolate`: use an *inherited overlay map*. Each context has a local `Map<Key, Realm>`; if a key is not present locally, lookup falls back to the parent context’s map. `ctx.isolate(key, realm)` writes only into the child’s local map.
+- `intercept`: use the same inherited-overlay strategy, so `ctx.intercept(key, metadata)` creates a child with a local merged entry without mutating the parent.
+
+The task text says `ctx.isolate.get(key)`, but this should be understood as the **effective resolved realm** after walking the parent chain. A small helper is needed:
+
+```
+function realmOf(ctx, key): Realm {
+  const r = ctx[ISOLATE].get(key);   // with parent fallback
+  return r === undefined ? key : r;
+}
+```
+
+With an inherited map, `ctx[ISOLATE].get(key)` can itself perform the fallback, so the rest of the module can keep the same call shape.
+
+### 2.3 Fiber registry and `all_fibers`
+
+Algorithm 3 iterates “all live fibers”. The class diagram does not explicitly show a registry field, but the paper’s Table 2 says the registry is enumerated through `ctx.registry`.
+
+**Resolution:** Add an internal, non-public registry to `Context`, for example:
+
+- `Context` carries a `registry: Map<number, Fiber>`.
+- Derived contexts share the same registry object.
+- `Lifecycle.use(ctx, component, config)` inserts the new fiber into `ctx[REGISTRY]`.
+- Fibers are removed when the loader performs an `O-Remove`-style disposal, or at least filtered by `retired`/live checks.
+
+`notify` can then iterate `ctx[REGISTRY].values()`. Sharing the registry across derived contexts means “fibers under `ctx`” is effectively “all fibers in the same root context tree,” which is the correct behavior for a shared coeffect store.
+
+### 2.4 Circular dependency management
+
+`coeffect.ts` imports `Lifecycle` to call `refresh`. `Context` imports coeffect helpers, and `Lifecycle` imports `EffectEngine` and `Fiber`.
+
+To avoid runtime cycles:
+
+- Use `import type` for `Context` and `Fiber` types.
+- For the runtime call to `Lifecycle.refresh`, import `Lifecycle` normally; ES module cycles are safe if the function is only invoked after module initialization.
+- Alternatively, have `Context` inject a `refresh` callback, but the design explicitly says `coeffect.ts` depends on `./lifecycle`, so a direct import is acceptable.
+
+---
+
+## 3. Function-by-Function Analysis
+
+### 3.1 `get(ctx, key): any`
+
+**Formal basis:** Definition 23 / Definition 29, simplified in the design.
+
+**Behavior:**
+
+1. Compute the effective realm:
+
+   ```
+   realm = realmOf(ctx, key)
+   ```
+
+2. Return the stored value:
+
+   ```
+   return ctx[STORE].get(realm)
+   ```
+
+**Important properties:**
+
+- `ctx.get` is a raw lookup. It does **not** check whether the current fiber declared `key`; that check belongs to the proxy-mediated access (`Algorithm 6` in Section 5.1.4).
+- If the key is absent or the realm has no binding, return `undefined`.
+- `get` has no side effects and no lifecycle impact.
+- It does **not** consult `ctx[INTERCEPT]` under the supplied design. The design stores raw values in `@@store`, not provider functions, so interception metadata is not automatically applied by `get`.
+
+### 3.2 `set(ctx, key, value): Dispose`
+
+**Formal basis:** Definition 23 / Definition 29, Algorithm 2, and the fact that `set(k, v)` is an effect function of type `𝔈*Σ`.
+
+**Behavior:**
+
+1. Resolve the realm and capture it in a closure:
+
+   ```
+   realm = realmOf(ctx, key)
+   ```
+
+2. Return `ctx.effect(callback)`, where `callback` performs:
+
+   ```
+   ctx[STORE].set(realm, value)
+   notify(ctx, [key])
+   ```
+
+3. The inverse returned by the callback performs:
+
+   ```
+   delete ctx[STORE].delete(realm)
+   notify(ctx, [key])
+   ```
+
+**Important properties:**
+
+- `ctx.effect` makes the binding revertible. The returned `Dispose` is the inverse.
+- The inverse must capture the **same realm used for writing**, not recompute it later, because the context’s `@@isolate` table may change before disposal.
+- `notify` must be called **after** the store mutation, both for installation and removal. This matches `config.yaml`’s `notificationTrigger: set-and-remove`.
+- If `set` is called inside a component’s `apply`, the returned `Dispose` can be yielded by an async-generator effect, but it is also automatically tracked by `ctx.effect` through `ctx.dispose`; the lifecycle must seed `fiber.dispose` from `fiber.ctx.dispose` so unload recovers even effects that were not explicitly yielded.
+- The paper’s precondition “a dependency cannot be provided twice” is not represented in the task signature. In this reproduction, the single-provider discipline is enforced upstream by the loader/fiber lifecycle. Optionally, `set` can throw if `ctx[STORE].has(realm)`, but the task’s simplified contract does not require it.
+
+### 3.3 `intercept(ctx, key, metadata): Context`
+
+**Formal basis:** Definition 31, `intercept(k, ν)`, and the “derived realization” of Section 3.2.3.
+
+**Behavior:**
+
+1. Derive a child context from `ctx`:
+
+   ```
+   child = ctx.derive()
+   ```
+
+2. Compute merged metadata:
+
+   ```
+   existing = effectiveIntercept(ctx, key)
+   merged   = mergeMetadata(existing, metadata)
+   ```
+
+3. Write the merged metadata into the child’s local `@@intercept` table:
+
+   ```
+   child[INTERCEPT].set(key, merged)
+   ```
+
+4. Return `child`.
+
+**Merge semantics:**
+
+- `config.yaml` specifies `interceptionMetadataMerge: right-biased`.
+- Default implementation:
+  - If both existing and incoming are plain objects: `{ ...existing, ...incoming }`, so fields in `metadata` overwrite fields in `existing`.
+  - Otherwise, the incoming `metadata` wins as the new value.
+- The design mentions “per-key merge”; if a custom merge function is available for `key`, it should be used instead.
+
+**Important properties:**
+
+- The original `ctx` is **not** mutated.
+- `intercept` does **not** call `notify`, because changing interception metadata does not change dependency satisfaction. This matches `loader.fieldDispatch.intercept: updateInPlace`.
+- The child context should preserve the same `fiber` owner as `ctx`, so proxy-mediated access still resolves correctly.
+
+### 3.4 `notify(ctx, keys): Fiber[]`
+
+**Formal basis:** Algorithm 3, Definition 26, and the reactive discipline of Section 3.2.2.
+
+**Behavior:**
+
+```
+affected = new Set<Fiber>()
+
+for each fiber in ctx[REGISTRY].values():
+  for each key in keys:
+    if key is declared by fiber (fiber.inject includes key)
+       and realmOf(fiber.ctx, key) === realmOf(ctx, key):
+         Lifecycle.refresh(fiber)
+         affected.add(fiber)
+         break   // one notification per fiber is enough
+
+return Array.from(affected)
+```
+
+**Why compare realms?**
+
+With isolation, the same logical `key` can resolve to different realm symbols in different contexts. A change to a binding in one realm must not wake fibers that read the same key from another realm. Comparing `realmOf(fiber.ctx, key)` with `realmOf(ctx, key)` implements exactly that.
+
+**Why call `Lifecycle.refresh`, not the lifecycle directly?**
+
+`refresh` is the reactive re-evaluation point:
+
+- It recomputes `fiber.target`.
+- It decides whether the fiber should activate, deactivate, or remain unchanged.
+- It respects `fiber.inertia`, so an in-flight transition is not interrupted.
+
+The classification into *activating*, *deactivating*, or *neutral* is not done in `notify` itself. `notify` only triggers re-evaluation; `refresh`’s target comparison performs the classification.
+
+**Important properties:**
+
+- If `keys` is empty, return `[]`.
+- A fiber that injects multiple changed keys should be refreshed only once.
+- The returned fiber array is used by `unload` in `lifecycle.ts`:
+
+  ```
+  await all(notify(fiber.ctx, provided(fiber)).map(f => f.awaitQuiescence()))
+  ```
+
+  Therefore `notify` must return the fibers whose target actually changed or whose refresh was scheduled, not just every fiber that matched.
+
+- Fibers in `FAILED` state may be safely refreshed; their target is already `null`, so `refresh` will not start a new transition.
+
+---
+
+## 4. Interaction with the Larger Lifecycle
+
+### 4.1 During activation
+
+When a component’s `apply` calls `ctx.set('db', value)`:
+
+1. The store is updated immediately.
+2. `notify` is called.
+3. Dependents refresh.
+
+However, a dependent will **not** activate yet, because `computeTarget` only treats a key as provided if the provider fiber is `ACTIVE`. During `reload`, the provider is still `LOADING`, so the dependent’s target remains unsatisfied.
+
+After the provider finishes `reload`, `lifecycle.ts` calls `notify(fiber.ctx, provided(fiber))` again; now the provider is `ACTIVE`, and dependents can activate.
+
+Thus the intermediate `notify` inside `set` is harmless and is required by Algorithm 2.
+
+### 4.2 During deactivation
+
+When a provider is unloaded:
+
+1. `refresh` first marks the provider `UNLOADING`.
+2. `unload` calls `notify(fiber.ctx, provided(fiber))`; dependents see that the provider is no longer `ACTIVE`, so their targets become unsatisfied and they start unloading.
+3. Only after all dependents reach `INACTIVE` does the provider’s `dispose` run.
+4. The provider’s `dispose` removes the store entry and calls `notify` again; at this point no active dependent remains, so the second notification causes no new transitions.
+
+This is exactly the **guarded withdrawal** of Section 4.3.1.
+
+---
+
+## 5. Edge Cases and Ambiguities
+
+### 5.1 `intercept` does not affect `get` in the simplified design
+
+The formal paper’s `get` takes an additional metadata argument and applies a provider function:
+
+```
+get(k, μ) = σ(k)(μ ⊕ ι(k))
+```
+
+The provided task design, however, specifies:
+
+```
+get(ctx, key) -> ctx.store.get(realm)
+```
+
+This means the simplified core does **not** apply interception metadata during `get`. The unit test list includes “`ctx.intercept` merges metadata and affects `ctx.get` via provider function,” which contradicts the supplied function contract. This should be flagged:
+
+- Either the test must be changed to verify that `intercept` returns a child context whose `@@intercept` slot is merged,
+- Or the design must be extended to support provider functions in the store and metadata-aware `get`.
+
+The analysis here follows the task’s explicit `get` contract.
+
+### 5.2 `set` and duplicate provisions
+
+The paper requires `k ∉ dom(σ)` for `set`. The simplified contract does not include this check. In practice, duplicate realms should not occur because provisions are disjoint by construction. If desired, `set` can defensively check `ctx[STORE].has(realm)` and throw, but the task does not require it.
+
+### 5.3 Derived contexts and child ownership
+
+`ctx.isolate` and `ctx.intercept` return derived contexts. These derived contexts must preserve the `fiber` owner from the parent context, so that `resolve(ctx, key)` in Algorithm 6 can walk the correct fiber chain. The root `fiber.ctx` created by `use` must have its `fiber` pointer set to the new fiber.
+
+### 5.4 Registry cleanup
+
+If a fiber is removed via an `O-Remove`-style operation, it should be removed from the shared registry so `notify` does not process it forever. If the reproduction only retires fibers, stale entries may remain. For long-running stress tests, the registry should delete fibers when the loader fully removes them.
+
+---
+
+## 6. Summary of Required Adjustments to the Stated Design
+
+To implement `coeffect.ts` correctly while following the paper, the implementation needs three internal accommodations:
+
+1. **Expose context slots via symbols** so `coeffect.ts` can access `@@store`, `@@isolate`, `@@intercept`.
+2. **Add an internal fiber registry** to `Context` (shared by derived contexts) so `notify` can find all live fibers.
+3. **Use inherited overlay maps for `@@isolate` and `@@intercept`** rather than copying, so ancestor realm/interception changes propagate to descendant contexts.
+
+These do not alter the public API or the formal model; they are implementation necessities for the separate-file design. `coeffect.ts` itself should then be a straightforward realization of Algorithm 2 and Algorithm 3, with the exact contracts described above.

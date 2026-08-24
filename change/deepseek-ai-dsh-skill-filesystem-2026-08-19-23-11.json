@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-skill-filesystem): update package contents",
+  "packageName": "@deepseek-ai/dsh-skill-filesystem",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

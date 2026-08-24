@@ -1,0 +1,6 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-web-search-perplexity): refine subagent header switcher",
+  "packageName": "@deepseek-ai/dsh-web-search-perplexity",
+  "email": "cc.yu@deepseek.com"
+}

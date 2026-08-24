@@ -1,0 +1,7 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-fs): read_image reports downscaled dimensions and coordinate scale",
+  "packageName": "@deepseek-ai/dsh-fs",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

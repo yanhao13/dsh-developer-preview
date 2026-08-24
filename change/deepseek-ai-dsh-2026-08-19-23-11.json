@@ -1,0 +1,6 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-cli): expand source upload envelope",
+  "packageName": "@deepseek-ai/dsh",
+  "email": "cc.yu@deepseek.com"
+}

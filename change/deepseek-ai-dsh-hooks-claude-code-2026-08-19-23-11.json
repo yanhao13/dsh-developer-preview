@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-hooks-claude-code): update package contents",
+  "packageName": "@deepseek-ai/dsh-hooks-claude-code",
+  "email": "cc.yu@deepseek.com"
+}

@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-gateway): pin the namespace atomic-visibility guarantee",
+  "packageName": "@deepseek-ai/dsh-api-gateway",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

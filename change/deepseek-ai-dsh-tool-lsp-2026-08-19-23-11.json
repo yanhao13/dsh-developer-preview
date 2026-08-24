@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-tool-lsp): update package contents",
+  "packageName": "@deepseek-ai/dsh-tool-lsp",
+  "email": "cc.yu@deepseek.com"
+}

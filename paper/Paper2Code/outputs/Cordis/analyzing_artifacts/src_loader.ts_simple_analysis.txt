@@ -1,0 +1,561 @@
+# Logic Analysis: `src/loader.ts`
+
+## 1. Role of `loader.ts`
+
+`loader.ts` implements the **declarative component loader** from Section 5.2 of the paper. It is the orchestrator-facing layer that sits above the core `Context`/`Fiber` lifecycle. Its job is:
+
+1. Accept a declarative configuration tree of `Entry` records.
+2. Realize those records as `Fiber` instances on a root `Context`.
+3. Keep the realized system in step with configuration changes.
+4. Implement managed isolation realms, including Algorithm 7 (`patch_isolation`).
+5. Provide the entry-rebuild entry point used by HMR.
+
+The loader does **not** implement the formal lifecycle itself; it delegates all lifecycle transitions to `Lifecycle`, `Fiber`, and `Context`. It only decides *which* fibers should exist and *with which configuration/scoping*.
+
+---
+
+## 2. Paper-to-Loader Mapping
+
+| Paper concept | Loader implementation |
+|---|---|
+| `Entry` (Definition 74) | `Entry` from `./types` |
+| `LoadedEntry` wrapper | `LoadedEntry` class/interface |
+| Keyed reconciliation | `diffEntries()` by `id` |
+| Field dispatch | `applyChange()` switch |
+| Managed realms / Algorithm 7 | `patchIsolation()` |
+| Local realm tagged by entry id | Realm symbols derived from `entry.id` |
+| Global realm named by string | Realm symbols derived from the string |
+| Delimiter `δ_k` | Per-key tag stored on `Context` and inherited |
+| `reload(entry.fiber)` | `Lifecycle.refresh(entry.fiber)` plus asynchronous transition |
+| Realm-aware notification | Extended `notify` with an `affected(fiber, key)` predicate |
+| HMR entry rebuild | Loader method invoked by `HMR.reload` after cache invalidation |
+
+---
+
+## 3. Data Structures and Internal State
+
+### 3.1 Public fields required by the design
+
+```ts
+class Loader {
+  context: Context;                 // root context for all fibers
+  entries: Map<string, LoadedEntry>; // keyed by Entry.id
+}
+```
+
+### 3.2 Internal LoadedEntry state
+
+The `LoadedEntry` interface from `./types` gives:
+
+```ts
+interface LoadedEntry {
+  id: string;
+  url: string;
+  config: any;
+  disabled: boolean;
+  fiber: Fiber | null;
+  isolate: Map<Key, Realm>;
+  intercept: Map<Key, Metadata>;
+  applyConfig(config: any): Promise<void>;
+}
+```
+
+The implementation also needs a few non-public bookkeeping fields:
+
+- `component: Component | null`  
+  The imported component module for this entry. Needed to compute the desired isolation map without re-importing the module on every field diff.
+- `isolateAnnotation?: boolean | string | undefined`  
+  The original `Entry.isolate` annotation. Useful for building a synthetic `Entry` from a `LoadedEntry` during diffing.
+- `loading: boolean`  
+  Guards against re-entrant reconciliation while an import/rebuild is in progress.
+
+### 3.3 Internal Context capabilities needed by the loader
+
+Algorithm 7 manipulates the fiber context’s `@@isolate`, `@@store`, and delimiter slots directly. Because those slots are private in the design, the loader should use a **module-private internal capability token** (e.g. a `Symbol` exported only from `context.ts`) so the public API remains unchanged. The needed operations are:
+
+- Read/write the `isolate` map at a fiber context.
+- Read/write the `intercept` map at a fiber context.
+- Read/write the delimiter map (`δ_k` tags) at a fiber context.
+- Read/delete/move entries in the shared `@@store`.
+- Enumerate live fibers or find the active provider for `(key, realm)`.
+
+These capabilities can be exposed as `Context` methods marked non-public, or as functions exported under the internal symbol.
+
+---
+
+## 4. Method-by-Method Logic
+
+### 4.1 `diffEntries(oldEntries, newEntries)`
+
+This method computes the keyed diff by `id`, as required by `config.yaml`:
+
+> `loader.reconciliationKey: id`
+
+#### Logic
+
+1. Build `Map<id, Entry>` for `oldEntries`.
+2. Build `Map<id, Entry>` for `newEntries`.
+3. For each id present in new but not old:
+   - `{ type: 'add', entry: newEntry }`
+4. For each id present in old but not new:
+   - `{ type: 'remove', entry: oldEntry, oldEntry: loadedEntry }`
+5. For each id present in both:
+   - If any meaningful field changed, emit `{ type: 'update', entry: newEntry, oldEntry: loadedEntry }`.
+
+#### Field equality
+
+A field “changed” should compare:
+
+- `url`: strict equality.
+- `disabled`: strict equality.
+- `config`: deep equality. Config is ordinary JSON-like data.
+- `intercept`: deep equality of `Record<Key, Metadata>`.
+- `isolate`: compare the **realized isolation map** from the old loaded entry against the **new desired isolation map** computed from the new `Entry.isolate` and the already-imported component. If the component is unavailable, compare raw annotations.
+
+#### Important subtlety
+
+Because `Change.oldEntry` is a `LoadedEntry`, the `remove` change should carry the corresponding loaded entry so `reconcile` can retire its fiber and delete it from `this.entries`.
+
+---
+
+### 4.2 `reconcile(entries)`
+
+#### Logic
+
+```text
+async function reconcile(newEntries):
+  oldEntries = this.entries.values().map(toSyntheticEntry)
+  changes = diffEntries(oldEntries, newEntries)
+
+  for change in changes:
+    if change.type == 'remove':
+      await removeEntry(change.oldEntry)
+    else:
+      await applyChange(change.entry)
+```
+
+#### Design decision: flat vs nested entries
+
+`reconcile` operates on the **flat top-level entry list**. Nested children in `Entry.children` are not automatically loaded as separate entries in `this.entries`; they are part of the `config` of a group component such as `@cordisjs/group`.
+
+For the reproduction, an `Entry` with `children` should be realized as a group component whose configuration is the child list. The group component internally uses `ctx.use` to instantiate children. The loader’s `diffEntries`/`applyChange` machinery can be re-used by group components through a **private reconciliation callback** if nested reconciliation is required.
+
+#### Quiescence
+
+`reconcile` should be deterministic for tests. Therefore, after an operation that changes lifecycle state, it should **await the quiescence of the affected fibers** where possible. In production, the framework could return earlier; but the paper’s confluence theorem guarantees eventual quiescence, so awaiting in the loader is safe and convenient.
+
+---
+
+### 4.3 `applyChange(entry)`
+
+`applyChange` is the field-dispatcher described in the paper:
+
+> `fieldDispatch`:
+> - `id` → rebuild
+> - `url` → rebuild
+> - `isolate` → patchIsolation
+> - `intercept` → updateInPlace
+> - `config` → componentHandles
+> - `disabled` → unload-or-reload
+
+#### 4.3.1 Add case
+
+If `this.entries` has no entry with `entry.id`:
+
+1. Import the component module from `entry.url`.
+2. Compute the desired isolation map from `entry.isolate` and the component.
+3. Create a `LoadedEntry` with `fiber: null`.
+4. Instantiate the fiber with `this.context.use(component, entry.config)`.
+5. Apply isolation and interception scopes to the fiber’s context.
+6. Store the loaded entry in `this.entries`.
+
+#### 4.3.2 URL or ID changed → rebuild
+
+A URL change is a full rebuild:
+
+1. If the old `LoadedEntry.fiber` exists:
+   - `fiber.markRetired()`
+   - `await fiber.awaitQuiescence()`
+   - This guarantees the old fiber is fully unloaded before the new one is inserted.
+2. Import the new component module from the new URL.
+3. Create a new fiber with `this.context.use(newComponent, entry.config)`.
+4. Apply the new isolation/interception scopes.
+5. Replace the old fiber in the loaded entry.
+
+Awaiting quiescence before creating the new fiber is essential for provider replacement: it prevents two fibers from temporarily providing the same key in the same realm.
+
+#### 4.3.3 Disabled changed
+
+- **disabled: true**
+  - Set `loaded.disabled = true`.
+  - If the fiber exists:
+    - `fiber.markRetired()`
+    - `await fiber.awaitQuiescence()`
+  - Do **not** delete the loaded entry; it remains in the map so it can be re-enabled later.
+  - The fiber object may remain in `loaded.fiber`, but it is retired and inactive. Alternatively, set `loaded.fiber = null` after quiescence; the choice must be consistent with re-enable logic.
+
+- **disabled: false**
+  - Set `loaded.disabled = false`.
+  - If `loaded.fiber` is non-null and retired:
+    - Clear the retired flag.
+    - Call `Lifecycle.refresh(fiber)` so it reloads if dependencies are satisfied.
+  - If `loaded.fiber` is null:
+    - Rebuild the fiber from `loaded.url` and `loaded.config`.
+
+#### 4.3.4 Isolate changed → patchIsolation
+
+If the desired isolation map differs from the current `loaded.isolate`, call `patchIsolation(loaded, newIsolation)`.
+
+This is the most intricate path; see Section 5.
+
+#### 4.3.5 Intercept changed → update in place
+
+The paper says interception metadata is consulted at read time and needs no reload.
+
+Implementation:
+
+1. Convert `entry.intercept` from `Record<Key, Metadata>` to `Map<Key, Metadata>`.
+2. Replace or merge the fiber context’s `@@intercept` slot in place.
+3. Update `loaded.intercept`.
+4. Do **not** touch the fiber lifecycle.
+
+If in-place mutation is impossible because `Context.intercept` derives a new context, the loader may replace `fiber.ctx` with a derived context **without** changing `fiber.state`, `fiber.committed`, or `fiber.target`. The derived context must preserve the `fiber` back-reference.
+
+#### 4.3.6 Config changed → componentHandles
+
+The paper says config changes are handed to the component, which decides how to apply them.
+
+Conservative loader behavior:
+
+1. If deep equality says the config is unchanged, do nothing.
+2. Set `loaded.config = entry.config`.
+3. If `loaded.fiber` is null or `loaded.disabled` is true, just record the config.
+4. Otherwise, call `loaded.applyConfig(entry.config)`.
+
+`LoadedEntry.applyConfig` should:
+
+- Store the new config.
+- If a custom config-update handler is available on the component, invoke it.
+- Otherwise, rebuild the fiber with the same component module and the new config.
+
+Rebuilding is safe and always converges because of the paper’s confluence theorem.
+
+---
+
+### 4.4 `patchIsolation(entry, newIsolation)`
+
+This implements Algorithm 7 and the managed realms description in Section 5.2.1.
+
+#### Goal
+
+Reassign an entry’s realm mappings from `ρ` to `ρ′` for some keys. The difficult part is deciding whether the binding stored at a realm is “owned by” the entry, and which dependents should be notified.
+
+#### Required internal primitives
+
+- `ctx.getTag(key)` / `ctx.setTag(key, tag)`  
+  Reads/writes the delimiter `δ_k` on a context. Tags are inherited through the context parent chain.
+- `ctx.getIsolateMap()` / `ctx.replaceIsolateMap(map)`  
+  Reads/replaces the `@@isolate` table.
+- `ctx.getStore()`  
+  Returns the shared `@@store` map for low-level binding moves.
+- `findProvider(ctx, key, realm)`  
+  Returns the active fiber that provides `key` in `realm`, or `null`.
+
+#### Step-by-step logic
+
+1. **Compute changed keys**
+
+   ```text
+   Δ = { k | currentIsolate.get(k) != newIsolation.get(k) }
+   ```
+
+   For a key whose current mapping is absent and new mapping is also absent, there is no change.
+
+2. **Write fresh delimiter tags**
+
+   For each `k ∈ Δ`, generate a fresh tag `d1` and store it on the entry’s fiber context:
+
+   ```text
+   ctx.setTag(k, Symbol("cordis:realm-tag"))
+   ```
+
+   This tag identifies “this entry’s isolate scope” for key `k`.
+
+3. **Capture diff records**
+
+   For each `k ∈ Δ`, record:
+
+   ```text
+   s1 = oldRealm(k)  // may default to k
+   s2 = newRealm(k)  // may default to k
+   d1 = entryCtx.getTag(k)
+   provider = findProvider(ctx, k, s1)
+   d2 = provider ? provider.ctx.getTag(k) : undefined
+   diff.set(k, { s1, s2, d1, d2 })
+   ```
+
+4. **Replace the isolate map**
+
+   ```text
+   ctx.replaceIsolateMap(newIsolation)
+   ```
+
+   From now on, this fiber resolves `k` through `s2`.
+
+5. **Move provider-owned bindings**
+
+   For each `k ∈ Δ`:
+
+   ```text
+   if d1 == d2:
+     if store.has(s1) && !store.has(s2):
+       store.set(s2, store.get(s1))
+       store.delete(s1)
+       update provider index if maintained
+     else if store.has(s1) && store.has(s2):
+       // configuration error: two providers in same realm and key
+       throw / log invariant violation
+   ```
+
+   The condition `d1 == d2` is exactly the paper’s `own(γ')` test: it holds when the provider fiber is the entry itself or was derived from the entry’s context, so the binding belongs to this entry and should move with it.
+
+6. **Realm-aware notification**
+
+   For each dependent fiber `F`, for each `k ∈ Δ`:
+
+   ```text
+   candidate = F.ctx.getIsolateMap().get(k) ?? k
+   if candidate != s1 && candidate != s2: continue
+   if !F.inject.includes(k): continue
+   depOwn = F.ctx.getTag(k) == d1
+   provOwn = d2 == d1
+   affected = depOwn != provOwn   // XOR
+   if affected: Lifecycle.refresh(F)
+   ```
+
+   The XOR is the paper’s `(fiber.ctx[δ_k] = d1) ≠ (d2 = d1)`.
+
+   Intuition:
+   - If dependent and provider are in the **same scope**, both move or neither moves, so the dependent’s view of `k` does not change.
+   - If dependent and provider are in **different scopes**, one side moves away and the other stays, so the dependent gains or loses access and must be re-evaluated.
+
+7. **Re-evaluate the entry itself**
+
+   ```text
+   Lifecycle.refresh(entry.fiber)
+   ```
+
+   This handles the case where the entry is itself a dependent of a key whose realm changed.
+
+#### Order of operations
+
+The paper’s Algorithm 7 calls `reload(entry.fiber)` before moving bindings. In a concrete implementation, we should **move bindings before the reload task actually executes** to avoid a window where a reloading fiber sees an empty realm. Concretely:
+
+- If `refresh` schedules an asynchronous transition, the binding move must happen before the transition task starts.
+- Therefore, the implementation order should be: write tags → replace isolate map → move bindings → notify → refresh.
+
+This is a faithful refinement of Algorithm 7, not a semantic change.
+
+---
+
+## 5. Private Helpers
+
+### 5.1 `buildIsolationMap(entry, component)`
+
+Compute the desired `Map<Key, Realm>` from `Entry.isolate`:
+
+- `isolate === true`
+  - For each key in `component.inject ∪ component.provide`, use a local realm tagged by `entry.id`:
+    - `Symbol("cordis:local:" + entry.id + ":" + key.toString())`
+  - Every entry with `isolate: true` gets an independent binding per key.
+- `isolate === "some-string"`
+  - For each key, use a global realm shared by all entries naming the same string:
+    - `Symbol("cordis:global:" + "some-string" + ":" + key.toString())`
+  - Moving such an entry does **not** change its realm; it changes which entries share the binding.
+- `isolate === undefined || false`
+  - Default shared realm: the key itself.
+
+If `component` is unavailable, fall back to using the entry’s declared `provide`/`inject`? Since `Entry` has no explicit keys, the component must be known. For rebuilds, the component is imported first. For patch-isolation, the old component is reused.
+
+### 5.2 `applyEntryScopes(fiber, isolation, intercept)`
+
+After a fiber is created:
+
+1. Start from `fiber.ctx`.
+2. For each `(key, realm)` in `isolation`, derive/apply the isolate mapping. In the internal implementation, this can mutate the isolate map directly, or create a derived context that preserves `fiber`.
+3. For each `(key, metadata)` in `intercept`, apply the interception metadata.
+4. Replace `fiber.ctx` with the final scoped context if derivation is used.
+
+The crucial invariant is that `fiber.ctx.fiber === fiber`.
+
+### 5.3 `retireAndAwait(fiber)`
+
+Used by rebuild/remove paths to guarantee orderly teardown.
+
+```text
+fiber.markRetired()
+await fiber.awaitQuiescence()
+```
+
+This respects the guarded-withdrawal invariant: if the fiber is a provider with active dependents, its unload will wait until those dependents deactivate.
+
+### 5.4 `rebuildEntry(entry, oldLoadedEntry)`
+
+Used when the URL changes, when a disabled entry is re-enabled without a fiber, or when config changes require reload.
+
+```text
+if old.fiber:
+  await retireAndAwait(old.fiber)
+  old.fiber = null
+
+component = await importComponent(entry.url)
+isolation = buildIsolationMap(entry, component)
+fiber = context.use(component, entry.config)
+applyEntryScopes(fiber, isolation, entry.intercept)
+
+old.fiber = fiber
+old.component = component
+old.isolate = isolation
+old.intercept = toMap(entry.intercept)
+old.config = entry.config
+old.disabled = entry.disabled
+```
+
+### 5.5 `importComponent(url)`
+
+Use dynamic `import()`:
+
+```text
+mod = await import(url)
+return mod.default ?? mod.component ?? mod
+```
+
+If Node’s module cache must be bypassed (for HMR), the loader should call an HMR-provided cache invalidation helper first. This is the design’s declared dependency of `loader.ts` on `./hmr`.
+
+---
+
+## 6. Invariants and Edge Cases
+
+### 6.1 Core invariants
+
+- `this.entries` is keyed by `Entry.id` (config.yaml: `reconciliationKey: id`).
+- A `LoadedEntry` with `disabled: true` has no actively-loading fiber.
+- A removed entry is first retired, awaited, then deleted from `this.entries`.
+- A rebuilt provider is fully unloaded before the replacement provider is inserted.
+- `patchIsolation` never moves a binding that belongs to a different provider.
+- After `patchIsolation`, the isolate map of the entry’s fiber equals the new desired map.
+- Interception updates never trigger `LOADING`/`UNLOADING` transitions.
+- Realm-aware notification only refreshes fibers whose `inject` contains the changed key.
+
+### 6.2 Edge cases
+
+1. **Reconcile called with the same entries**  
+   `diffEntries` should return no changes, so the system remains untouched.
+
+2. **Multiple fields change at once**  
+   The dispatcher should process in priority order:
+   - URL changed → rebuild (covers config, isolate, intercept).
+   - Disabled changed → unload or refresh.
+   - Isolate changed → patch isolation.
+   - Intercept changed → update in place.
+   - Config changed → applyConfig.
+
+3. **Provider replacement**  
+   If entry A provides `db` and entry B also suddenly declares `provide: ['db']`, the single-provider discipline should be preserved. The loader can detect this by checking the new loaded entry’s `provide` against currently active fibers before instantiating, and reject/wait accordingly.
+
+4. **Fiber already in a transition**  
+   `markRetired()` and `refresh()` are inertial-safe: if `fiber.inertia` is non-null, the transition in progress will observe the new target and chain into unload/reload.
+
+5. **Realm conflict during binding move**  
+   If `store.has(s2)` when moving a provider-owned binding, the configuration is invalid. The loader should fail loudly rather than silently drop one binding.
+
+6. **Realm discard**  
+   The paper says a realm is discarded once no entry names it. The loader can maintain a reference count of entries per `(key, realm)`. After a removal or patch, if the count reaches zero and the realm’s binding was moved/deleted, no further action is required; the store entry should already be gone because effects were reverted.
+
+7. **Group entries / nested children**  
+   If `Entry.children` is used, the group component is responsible for loading children. The loader’s `entries` map tracks the group entry itself. If the paper’s recursive “same per-field dispatch” is required for tests, the group component should receive a private `reconcileChildren` callback that calls `diffEntries` and `applyChange` on the child list.
+
+---
+
+## 7. Configuration Alignment
+
+`config.yaml` is directly reflected in the loader:
+
+| Config key | Loader behavior |
+|---|---|
+| `loader.reconciliationKey: id` | `entries` map and `diffEntries` keyed by `id` |
+| `fieldDispatch.url/id: rebuild` | `applyChange` calls `rebuildEntry` |
+| `fieldDispatch.disabled: unload-or-reload` | disable → retire/await; enable → refresh/rebuild |
+| `fieldDispatch.isolate: patchIsolation` | `applyChange` calls `patchIsolation` |
+| `fieldDispatch.intercept: updateInPlace` | no lifecycle transition |
+| `fieldDispatch.config: componentHandles` | `LoadedEntry.applyConfig` decides, conservative reload otherwise |
+| `managedRealms.delimiterPerKey: true` | `Context` maintains per-key delimiter tags |
+| `managedRealms.localRealmTag: entry.id` | local realms derived from entry id |
+| `managedRealms.globalRealmTag: named-string` | global realms derived from string |
+| `loader.groupComponents` | loader recognizes these URLs and passes children as config |
+
+---
+
+## 8. Interaction with HMR
+
+`HMR.reload` needs to replace stale entries transactionally. The loader supports this by exposing the rebuild path:
+
+1. HMR calls `invalidateCaches(accepted)` to force fresh module imports.
+2. For each stale `LoadedEntry`, HMR calls `loader`’s rebuild operation:
+   - retire old fiber
+   - await quiescence
+   - import fresh component
+   - create fresh fiber
+   - apply isolation/interception
+3. If any step throws, HMR restores the module cache and rebuilds from backup modules.
+
+The loader and HMR should avoid a circular runtime dependency:
+
+- `loader.ts` imports HMR’s cache/import utilities.
+- `hmr.ts` imports `LoadedEntry` from `./types` and uses loader methods at runtime.
+- In TypeScript, type-only imports can break the runtime cycle if needed.
+
+---
+
+## 9. Suggested Loader Tests
+
+To validate `loader.ts` against the paper’s claims:
+
+1. **Initial reconcile**  
+   Reconcile three entries: database provider, adapter, command. Assert all become ACTIVE in dependency order.
+
+2. **Diff detection**  
+   Add, remove, and update entries; assert `diffEntries` returns the expected `Change` list.
+
+3. **Disabled toggle**  
+   Disable the adapter; assert adapter and its dependents unload in order. Re-enable; assert they reload.
+
+4. **URL rebuild**  
+   Change a component URL; assert old fiber is unloaded before new fiber is created.
+
+5. **Isolation local vs global**  
+   Two entries with `isolate: true` for the same key receive independent bindings. Two entries with `isolate: "shared"` receive the same binding.
+
+6. **Algorithm 7 binding move**  
+   Change an entry’s isolation scope; assert the provider-owned binding moves to the new realm and a foreign provider’s binding stays.
+
+7. **Affected-predicate XOR**  
+   Construct dependents inside and outside the entry’s scope; assert only the cross-scope ones are refreshed.
+
+8. **Interception update without reload**  
+   Change `entry.intercept`; assert the fiber does not pass through LOADING/UNLOADING.
+
+9. **Config change**  
+   Change `entry.config`; assert the fiber re-applies only on material change.
+
+10. **HMR rollback integration**  
+   Simulate a bad module; assert the loader can rebuild stale entries after cache restore.
+
+---
+
+## 10. Open Questions / Assumptions
+
+- **Nested child entries**: The design’s `entries` map is flat. For full recursive reconciliation, `LoadedEntry` would need a parent/children relationship. The reproduction can defer this to `@cordisjs/group`.
+- **Internal slot access**: The loader needs privileged access to `Context`’s private isolate/store/intercept/tag slots. This should be implemented with module-private functions rather than widening the public API.
+- **Config update semantics**: The paper says the component decides. Since the `Component` interface has no `onConfig` method, the loader conservatively rebuilds on any material config change.
+- **Single-provider enforcement**: The core lifecycle may assume it; the loader must avoid concurrent replacement providers by awaiting old-fiber quiescence before new-fiber insertion.

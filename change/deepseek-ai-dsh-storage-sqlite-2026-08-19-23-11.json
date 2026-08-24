@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-storage-sqlite): update package contents",
+  "packageName": "@deepseek-ai/dsh-storage-sqlite",
+  "email": "cc.yu@deepseek.com"
+}

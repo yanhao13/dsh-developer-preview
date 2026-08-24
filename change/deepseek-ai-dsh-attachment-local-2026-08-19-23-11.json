@@ -1,0 +1,7 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-attachment-local): store a deterministic canonical image encoding",
+  "packageName": "@deepseek-ai/dsh-attachment-local",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

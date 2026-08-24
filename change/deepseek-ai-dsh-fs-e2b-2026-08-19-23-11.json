@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-fs-e2b): update package contents",
+  "packageName": "@deepseek-ai/dsh-fs-e2b",
+  "email": "cc.yu@deepseek.com"
+}

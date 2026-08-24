@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-tool-agent-team): update package contents",
+  "packageName": "@deepseek-ai/dsh-experimental-tool-agent-team",
+  "email": "cc.yu@deepseek.com"
+}

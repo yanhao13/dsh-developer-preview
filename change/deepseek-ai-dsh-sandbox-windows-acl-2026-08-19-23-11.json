@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-sandbox-windows-acl): isolate bwrap PID namespace",
+  "packageName": "@deepseek-ai/dsh-sandbox-windows-acl",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

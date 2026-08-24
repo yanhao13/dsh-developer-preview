@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-acp): use unique temp dirs for acp-demo composition persistence",
+  "packageName": "@deepseek-ai/dsh-acp",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

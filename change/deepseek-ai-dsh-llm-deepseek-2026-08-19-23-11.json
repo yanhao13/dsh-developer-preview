@@ -1,0 +1,7 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-llm-deepseek): sign in to a provider instead of withholding it",
+  "packageName": "@deepseek-ai/dsh-llm-deepseek",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

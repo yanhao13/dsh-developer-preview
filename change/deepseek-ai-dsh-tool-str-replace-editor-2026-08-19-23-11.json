@@ -1,0 +1,7 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-tool-str-replace-editor): read_image reports downscaled dimensions and coordinate scale",
+  "packageName": "@deepseek-ai/dsh-tool-str-replace-editor",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

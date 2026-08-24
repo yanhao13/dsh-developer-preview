@@ -1,0 +1,491 @@
+# Logic Analysis: `src/hmr.ts`
+
+## 1. Role of the File
+
+`src/hmr.ts` realizes Section 5.2.2 of the paper: **Hot Module Replacement (HMR)**. It implements the three-phase engine of Algorithms 8–10:
+
+1. **Phase 1 — Module classification** (`classify`): decide which changed modules are safe to reload (`accepted`) and which force a full restart (`declined`).
+2. **Phase 2 — Stale-entry detection** (`detectStale`, `getDependencies`): find component entries whose dependency trees reach an accepted module.
+3. **Phase 3 — Transactional reload** (`reload`, `invalidateCaches`, `restoreCaches`): dispose old fibers, import fresh component modules, create new fibers, and roll back atomically on failure.
+
+The file must integrate with:
+
+- `Context` — the root context on which fibers are instantiated.
+- `Lifecycle` — to retire/dispose old fibers and start fresh ones.
+- `LoadedEntry` (`types.ts`) — because HMR operates on loader entries.
+- Node.js module caches — for cache invalidation and rollback.
+
+---
+
+## 2. Dependency and Circular-Import Strategy
+
+The design lists `./loader` as a dependency, but a hard runtime import of `Loader` from `hmr.ts` would create a cycle because the loader may use HMR-related module utilities. The safest approach is:
+
+- Import **types only** from `./types`.
+- Import `Lifecycle` from `./lifecycle` for fiber disposal/reinstantiation.
+- Do **not** import the `Loader` class at runtime.
+- Use `LoadedEntry` structurally via the type system.
+- If module-resolution helpers are shared with the loader, place them in a separate internal helper or use lazy imports.
+
+This preserves the public API while avoiding circular initialization problems.
+
+---
+
+## 3. Module Identity and Path Normalization
+
+All HMR methods operate on module URLs. The same logical module can appear as:
+
+- a raw entry URL: `"./plugins/db.ts"`
+- an absolute path: `"/project/plugins/db.ts"`
+- a `file://` URL: `"file:///project/plugins/db.ts"`
+- a `require.resolve` key.
+
+Therefore every method must normalize inputs before comparing sets or touching `require.cache`.
+
+### Required normalization rules
+
+- If the URL starts with `file://`, convert it to a filesystem path with `fileURLToPath`.
+- If it is relative or absolute, resolve it with `path.resolve`.
+- If it is a bare specifier, resolve it with `require.resolve(specifier, { paths: [cwd] })` when possible.
+- Use `fs.realpathSync` where available so symlinks do not cause duplicate identities.
+- Treat Node builtins (`node:*`, `fs`, `path`, etc.) as special: they are never hot-replaced and should be treated as declined/unresolvable.
+
+Recommended helper functions inside `HMR` (private methods) are:
+
+- `normalizeUrl(url): string`
+- `isBuiltin(url): boolean`
+- `resolveModulePath(url): string`
+
+`getImports` must return normalized paths so that sets can be compared safely.
+
+---
+
+## 4. Method-by-Method Analysis
+
+### 4.1 `getImports(url: string): Set<string>`
+
+**Purpose:** Return the direct static imports of a module. This corresponds to `get_imports(url)` in Algorithms 8 and 9.
+
+**Behavior:**
+
+1. Normalize `url`.
+2. Check an internal `importCache`; return a copy to prevent external mutation.
+3. If the module is a builtin or the file does not exist, return an empty set.
+4. Read the source file.
+5. Parse for:
+   - `import ... from "spec"`;
+   - `import "spec"`;
+   - `export ... from "spec"`;
+   - `require("spec")`;
+   - literal `import("spec")`.
+6. For each specifier:
+   - **Relative specifier** (`./`, `../`): resolve against `path.dirname(importingFile)`; try the exact path, then extension candidates `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, and `/index.*`.
+   - **Bare specifier**: use `require.resolve(spec, { paths: [dirname] })`; if resolution fails, keep the unresolved specifier so it can be classified as declined later.
+   - **Builtin**: keep its name, but `getImports` will return an empty set for builtins.
+7. Cache and return `Set<string>`.
+
+**Edge cases:**
+
+- Cycles: `getImports` itself is not recursive; recursion is handled by `getDependencies`.
+- Missing files: do not throw; treat as unresolved.
+- Dynamic imports with non-literal arguments are not statically resolvable; the config explicitly accepts this limitation.
+
+---
+
+### 4.2 `classify(stashed: Set<string>, externals: Set<string>): Classification`
+
+**Purpose:** Implement Algorithm 8.
+
+**Inputs:**
+
+- `stashed` — changed file URLs.
+- `externals` — modules that cannot be hot-replaced and require a full restart.
+
+**Output:**
+
+```ts
+interface Classification {
+  accepted: Set<string>;
+  declined: Set<string>;
+}
+```
+
+**Algorithm (faithful to paper):**
+
+```
+accepted = new Set(stashed)
+declined = new Set(externals)
+
+// External modules take precedence if overlap occurs.
+for url of declined:
+  accepted.delete(url)
+
+pending = new Set()
+
+// Seed pending with direct importers of changed modules.
+for url of stashed:
+  if declined.has(url): continue
+  for dep of getImports(url):
+    if !accepted.has(dep) && !declined.has(dep):
+      pending.add(dep)
+
+repeat:
+  progress = false
+  for url of Array.from(pending):
+    imports = getImports(url)
+
+    if imports ∩ accepted ≠ ∅:
+      accepted.add(url)
+      pending.delete(url)
+      progress = true
+
+    else if imports ⊆ declined:   // empty set is vacuously true
+      declined.add(url)
+      pending.delete(url)
+      progress = true
+
+    else:
+      for dep of imports:
+        if !accepted.has(dep) && !declined.has(dep) && !pending.has(dep):
+          pending.add(dep)
+          progress = true
+
+until !progress
+
+// Any module still pending is undecided and defaults to declined.
+declined = declined ∪ pending
+
+return { accepted, declined }
+```
+
+**Important interpretation:**
+
+- A pending module is **accepted** if any of its imports is accepted.
+- A pending module is **declined** if all of its imports are declined.
+- The algorithm intentionally does not recursively accept transitive importers of accepted modules here; Phase 2 performs that closure through entry dependency trees.
+- If `stashed` and `externals` overlap, `externals` should win. This is a small robustness improvement over the literal paper text, which assumes disjoint inputs.
+
+---
+
+### 4.3 `getDependencies(root: string, declined: Set<string>): Set<string>`
+
+**Purpose:** Implement Algorithm 9’s `get_dependencies` traversal.
+
+**Behavior:**
+
+1. Normalize `root`.
+2. Traverse the import graph starting at `root`.
+3. Do not enter modules already visited or modules in `declined`.
+4. Include the visited module in the returned set.
+5. Recurse into `getImports(module)`.
+6. Avoid infinite recursion through cycles using the visited set.
+
+**Semantics of the `declined` boundary:**
+
+- A declined module is **not included** in the dependency tree.
+- Traversal stops at declined modules.
+- Therefore, if the root itself is declined, the returned tree is empty. This is consistent with the paper: declined modules trigger a full restart; they are not hot-reloaded.
+
+**Pseudo-code:**
+
+```
+getDependencies(root, declined):
+  deps = new Set()
+  normalizedRoot = normalizeUrl(root)
+
+  traverse(url):
+    if deps.has(url) or declined.has(url):
+      return
+    deps.add(url)
+    for child of getImports(url):
+      traverse(child)
+
+  traverse(normalizedRoot)
+  return deps
+```
+
+---
+
+### 4.4 `detectStale(entries: LoadedEntry[], accepted: Set<string>, declined: Set<string>): LoadedEntry[]`
+
+**Purpose:** Implement Algorithm 9’s `detect`.
+
+**Behavior:**
+
+1. For each entry, compute `tree = getDependencies(entry.url, declined)`.
+2. If `tree ∩ accepted ≠ ∅`, the entry is stale.
+3. When an entry is stale, fold its whole dependency tree into `accepted`.
+4. Return the stale entries, preserving input order.
+
+**Why folding matters:**
+
+- Phase 3 invalidates all accepted modules.
+- If an entry must be reloaded, every module in its dependency tree must also be invalidated so the fresh component imports fresh dependencies.
+- Folding also makes later entries sharing the same tree stale without recomputation.
+
+**Important detail:**
+
+- `accepted` is mutated. This matches the paper.
+- If an entry is disabled (`entry.fiber === null`), it can still be marked stale; Phase 3 may skip it but the module cache is still invalidated.
+
+**Pseudo-code:**
+
+```
+detectStale(entries, accepted, declined):
+  stale = []
+  for entry of entries:
+    tree = getDependencies(entry.url, declined)
+    if tree ∩ accepted ≠ ∅:
+      for mod of tree:
+        accepted.add(mod)
+      stale.push(entry)
+  return stale
+```
+
+---
+
+### 4.5 `invalidateCaches(accepted: Set<string>): Map<string, any>`
+
+**Purpose:** Back up modules before clearing caches.
+
+**Implementation strategy:**
+
+For every accepted URL:
+
+1. Normalize and resolve the URL.
+2. Look up the CommonJS cache entry: `require.cache[resolved]`.
+3. Store a backup record:
+
+```ts
+{
+  cached: NodeModule | null,
+  exports: NodeModule ? (module.exports?.default ?? module.exports) : undefined
+}
+```
+
+4. Delete `require.cache[resolved]`.
+
+**Why store `exports`?**
+
+- On rollback, the old component object is needed without re-importing the module.
+- `backup.get(entry.url).exports` gives the previous component (or module namespace).
+- This is exactly what Algorithm 10’s `backup[entry.url]` needs after `restoreCaches`.
+
+**ESM caveat:**
+
+- Node.js does not expose a public ESM cache.
+- The implementation should at minimum clear the CommonJS cache.
+- Under `tsx`/Vitest, modules may be CommonJS or ESM; for the fixture tests we can target CommonJS-compatible modules.
+- If pure ESM must be supported, a practical approach is to import with a fresh query string, but that makes transactional rollback harder. The paper explicitly notes both CJS and ESM caches may need clearing; our implementation should document that the CommonJS cache is authoritative for the provided fixtures.
+
+**Pseudo-code:**
+
+```
+invalidateCaches(accepted):
+  backup = new Map()
+  for url of accepted:
+    resolved = normalizeUrl(url)
+    cached = require.cache[resolved] ?? null
+    backup.set(url, {
+      cached,
+      exports: cached ? (cached.exports?.default ?? cached.exports) : undefined
+    })
+    delete require.cache[resolved]
+  return backup
+```
+
+---
+
+### 4.6 `restoreCaches(backup: Map<string, any>): void`
+
+**Purpose:** Roll back cache invalidation after a failed reload.
+
+**Behavior:**
+
+1. For each `[url, record]` in `backup`:
+   - Resolve the URL.
+   - If `record.cached` exists, restore `require.cache[resolved] = record.cached`.
+   - Otherwise, delete `require.cache[resolved]`.
+
+**Constraints:**
+
+- `restoreCaches` must be called **before** recreating fibers from backup modules, so later imports see the old module graph.
+- The function is synchronous and must not throw; if a restore fails, log and continue.
+
+---
+
+### 4.7 `reload(ctx: Context, accepted: Set<string>, staleEntries: LoadedEntry[]): Promise<void>`
+
+**Purpose:** Implement Algorithm 10 transactionally.
+
+**Core flow:**
+
+```
+reload(ctx, accepted, staleEntries):
+  backup = invalidateCaches(accepted)
+  parents = staleEntries.map(e => e.fiber?.parentCtx ?? ctx)   // capture before disposal
+  created = []
+
+  try:
+    for i, entry of staleEntries:
+      if entry.fiber:
+        await retireAndDrain(entry.fiber)
+
+      if entry.disabled:
+        continue
+
+      component = await importComponent(entry.url)
+      entry.fiber = parents[i].use(component, entry.config)
+      created.push(entry.fiber)
+
+    await Promise.all(created.map(f => f.awaitQuiescence()))
+
+  catch error:
+    restoreCaches(backup)
+
+    for i, entry of staleEntries:
+      if entry.fiber:
+        await retireAndDrain(entry.fiber)
+
+      oldComponent = backup.get(normalizeUrl(entry.url))?.exports
+      if oldComponent:
+        entry.fiber = parents[i].use(oldComponent, entry.config)
+
+    await Promise.all(
+      staleEntries
+        .map(e => e.fiber)
+        .filter(Boolean)
+        .map(f => f.awaitQuiescence())
+    )
+
+    throw error
+```
+
+**Key design decisions:**
+
+1. **Dispose via lifecycle, not raw `fiber.dispose()`.**
+
+   Raw `fiber.dispose()` only runs the accumulator. It does not:
+
+   - remove the fiber from the provider index;
+   - mark it UNLOADING;
+   - notify dependents;
+   - drain dependent fibers.
+
+   Therefore the correct operation is:
+
+   ```
+   fiber.retired = true
+   Lifecycle.refresh(fiber)
+   await fiber.awaitQuiescence()
+   ```
+
+   This makes the old fiber stop being ACTIVE before a new fiber with the same `provide` set is created, preserving the disjoint-provision invariant.
+
+2. **Use the original parent context for the new fiber.**
+
+   For nested entries, the parent may be a group context, not the top-level `ctx` argument. So capture `entry.fiber.parentCtx` before disposing.
+
+3. **Create all new fibers before waiting for quiescence.**
+
+   If entry A depends on entry B and both are stale, waiting for A to become ACTIVE before B is reloaded can deadlock. Creating all fibers first and then awaiting all avoids this.
+
+4. **Rollback must also dispose partially-created new fibers.**
+
+   In the catch block, every stale entry’s current fiber is retired and drained, including fibers created during the failed reload attempt.
+
+5. **Fallback component source.**
+
+   Use `backup.get(normalizeUrl(entry.url)).exports` as the component. This avoids re-importing the module, which would be unreliable after cache restoration.
+
+6. **Disabled entries.**
+
+   If `entry.disabled === true`, skip fiber creation. The cache was still invalidated so the next enable will import the fresh module.
+
+---
+
+## 5. Integration with the Loader
+
+`HMR.reload` mutates `LoadedEntry.fiber` directly. This is sufficient because:
+
+- `Loader.entries` holds the same `LoadedEntry` objects.
+- `Loader.entries.get(id).fiber` sees the new fiber after HMR completes.
+- The loader’s reconciliation uses `Entry.id` as the key; HMR does not change `id` or `url`.
+
+One caveat: if reload creates a new fiber via `parent.use(...)`, the parent context’s `dispose` chain records the new fiber as a child. The old fiber’s registration effect is still present in the parent unless the old fiber was properly retired; our rollback/retire path makes the old fiber inert, so duplicate provisioning is avoided.
+
+---
+
+## 6. Configuration Mapping
+
+The `config.yaml` fields map directly to implementation behavior:
+
+| Config key | Implementation |
+|---|---|
+| `classification.seededWith: stashed` | `accepted = new Set(stashed)` |
+| `classification.declinedWith: externals` | `declined = new Set(externals)` |
+| `classification.acceptRule: any-import-accepted` | `if getImports(url) ∩ accepted ≠ ∅` |
+| `classification.declineRule: all-imports-declined` | `else if imports ⊆ declined` |
+| `classification.cycleDefault: declined` | `declined = declined ∪ pending` |
+| `staleDetection.dependencyBoundary: declined` | `getDependencies` stops at `declined` |
+| `staleDetection.staleRule: dependency-tree-intersects-accepted` | `if tree ∩ accepted ≠ ∅` |
+| `reload.transactional: true` | try/catch around disposal and recreation |
+| `reload.cacheBackup: true` | `invalidateCaches` stores backup |
+| `reload.cacheRestoreOnError: true` | `restoreCaches` in catch block |
+
+---
+
+## 7. Important Edge Cases
+
+### 7.1 Overlap between `stashed` and `externals`
+
+If a changed module is also external, it cannot be hot-replaced. The implementation should remove it from `accepted`, leaving it only in `declined`. Otherwise Phase 2 might attempt to reload an external module.
+
+### 7.2 Empty imports for a pending module
+
+A pending module with no imports satisfies `imports ⊆ declined` vacuously and is declined. This is consistent with Algorithm 8.
+
+### 7.3 Undecided modules form an import cycle
+
+Modules that remain pending after the fixed point are placed in `declined`. This matches `cycleDefault: declined`.
+
+### 7.4 Declined root entry
+
+If a component entry’s own URL is in `declined`, `getDependencies` returns an empty tree, so the entry is not marked stale. The correct behavior is that such an entry cannot be hot-reloaded and should force a full restart. The HMR engine itself can document this; the orchestrator is responsible for reacting to the `declined` set.
+
+### 7.5 Duplicate active providers during replacement
+
+If old fiber is still ACTIVE when the new fiber is created, two fibers may have overlapping `provide` sets. The lifecycle’s insertion constraint forbids this. Therefore `reload` must fully drain the old fiber before `parent.use` is called.
+
+### 7.6 Failure after some fibers were replaced
+
+The catch block:
+
+1. Restores module caches;
+2. Disposes all current fibers of stale entries (including newly created ones);
+3. Recreates fibers from backup component objects;
+4. Rethrows.
+
+This gives a transactional guarantee: either all stale entries use the fresh modules, or all use the old modules.
+
+---
+
+## 8. Testing Implications
+
+`tests/core.test.ts` case 10 exercises HMR rollback. The test should:
+
+1. Create temporary fixture components with simple `import`/`require` relationships.
+2. Load a component through the `Loader`.
+3. Simulate a changed and syntactically invalid file.
+4. Call `classify` with the changed file in `stashed`.
+5. Call `detectStale` on loaded entries.
+6. Call `reload` and expect it to throw.
+7. Assert the original fiber is active and the original component still provides its coeffects.
+
+For deterministic behavior, the fixtures should use relative imports of TypeScript/CommonJS modules that can be resolved by the built-in scanner.
+
+---
+
+## 9. Summary
+
+`src/hmr.ts` must implement Algorithms 8–10 exactly, with careful path normalization and cache handling. The most important correctness concern is that replacing a component means **retiring and draining the old fiber through the lifecycle**, not merely invoking its accumulator. That preserves the paper’s temporal and spatial composability guarantees during module replacement and makes the reload transactionally safe.

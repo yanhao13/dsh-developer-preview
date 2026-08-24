@@ -1,0 +1,45 @@
+## Code: src/index.ts
+
+```typescript
+/**
+ * src/index.ts
+ *
+ * Public API barrel for the Cordis reproduction.
+ *
+ * This module contains no logic; it only re-exports the framework surface
+ * that the rest of the project (tests, `main.ts`, and downstream consumers)
+ * uses.
+ *
+ * The exports map to the paper's architecture as follows:
+ *
+ * | Export          | Paper artifact                                            |
+ * |-----------------|-----------------------------------------------------------|
+ * | `Context`       | `Γ∞` — the first-class unified context (Section 3.3)      |
+ * | `Fiber`         | one component instantiation (Definition 44)               |
+ * | `EffectEngine`  | revertible effect tracking / `effectiter Γ` (Algorithm 1) |
+ * | `Lifecycle`     | the inertial state machine (Section 4.3, Algorithms 4–5)  |
+ * | `Loader`        | declarative configuration reconciliation (Section 5.2)    |
+ * | `HMR`           | hot module replacement (Section 5.2.2, Algorithms 8–10)   |
+ * | all types       | the executable vocabulary of `types.ts`                   |
+ *
+ * The `Context` and `Fiber` structural interfaces declared in `./types` are
+ * intentionally not re-exported under those names: the concrete class exports
+ * of the same name shadow them, and consumers receive the class types, which
+ * satisfy the structural interfaces.  All remaining public types from
+ * `./types` are re-exported type-only via `export type *`.
+ *
+ * This barrel introduces no additional runtime import edges: it only
+ * re-exports modules that are themselves acyclic with respect to the
+ * dependencies they import at runtime (see the module-graph analysis in the
+ * project plan).  Nothing is instantiated here; consumers create their own
+ * root `Context` and build up a system from there.
+ */
+
+export { Context } from './context';
+export { Fiber } from './fiber';
+export { Lifecycle } from './lifecycle';
+export { EffectEngine } from './effect';
+export { Loader } from './loader';
+export { HMR } from './hmr';
+export type * from './types';
+```

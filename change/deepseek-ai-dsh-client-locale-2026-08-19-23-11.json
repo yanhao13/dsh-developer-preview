@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-locale): align turn-error prose with exhausted-retry rendering",
+  "packageName": "@deepseek-ai/dsh-client-locale",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-ui-directory-picker-browse): align turn-error prose with exhausted-retry rendering",
+  "packageName": "@deepseek-ai/dsh-client-ui-directory-picker-browse",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

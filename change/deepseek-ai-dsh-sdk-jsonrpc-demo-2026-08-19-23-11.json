@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-jsonrpc-demo): update package contents",
+  "packageName": "@deepseek-ai/dsh-sdk-jsonrpc-demo",
+  "email": "cc.yu@deepseek.com"
+}

@@ -1,0 +1,549 @@
+# Logic Analysis: Cordis Reproduction (`src/index.ts` and the framework it re-exports)
+
+This analysis is the reasoning artifact that guides the implementation of the Cordis meta-framework reproduction. It is written for the barrel file `src/index.ts` in the sense that every module re-exported by that barrel is analyzed here — `src/index.ts` itself contains no logic, but it is the public surface that exposes a fully coherent, formally-grounded runtime. The analysis follows the paper's Section 3 (revertible effects / reactive coeffects), Section 4 (calculus and metatheory), Section 5 (implementation), the design's data structures, the task's file-by-file logic, and the `config.yaml` settings. No values, hyperparameters, or behaviors are assumed beyond those in the paper and config.
+
+---
+
+## 1. What Is Being Reproduced and How We Validate It
+
+The paper contains no numeric benchmark suite. Its evidence is (a) formal metatheory and (b) the Koishi production case study. Therefore "reproducing the experiments" means:
+
+1. Rebuilding the runtime so that the paper's invariants hold structurally:
+   - temporal composability: complete LIFO recovery on unload (Theorems 7, 16, 61, 62);
+   - spatial composability: dependency-driven activation/deactivation and guarded withdrawal (Theorems 63, 64);
+   - progress and confluence: from any finite acyclic configuration, the system reaches a unique quiescent state (Theorems 66, 73).
+2. Constructing synthetic Koishi-like plugin scenarios exercising the lifecycle, loader reconciliation, realm reassignment, and transactional HMR.
+3. Property-testing the invariants with `fast-check` under `vitest`.
+
+`config.yaml` fixes the implementation surface:
+- `core.effectTracking.executionModel: async-generator`, `inverseComposition: LIFO`, `armedGuard: true`, `guardCheckPerIteration: true`, `disposalIsIdempotent: true`.
+- `core.lifecycle.states: [INACTIVE, LOADING, ACTIVE, UNLOADING, FAILED]`, `inertialTransitions: true`, `committedViewFixity: true`, `withdrawalGuard: true`, `failedFiberTarget: null`.
+- `loader.reconciliationKey: id`, `managedRealms.delimiterPerKey: true`.
+- `hmr.classification.acceptRule: any-import-accepted`, `declineRule: all-imports-declined`, `cycleDefault: declined`, `reload.transactional: true`.
+- `tests.propertyTesting: fast-check`, with the six named properties.
+
+---
+
+## 2. Module Dependency Graph and Circular-Import Strategy
+
+The task's module list implies a cycle-prone graph. The design says `Context` methods delegate lazily; the analysis makes that concrete.
+
+**Runtime import graph (only runtime imports cause cycles; `import type` is compile-time only):**
+
+```
+types.ts        — no imports
+effect.ts       — imports types (type), context (type only)
+fiber.ts        — imports types (type), context (type only)
+coeffect.ts     — imports types (type), context (type only), lifecycle (runtime; for refresh)
+lifecycle.ts    — imports types (type), context (type only), effect (runtime), fiber (runtime)
+context.ts      — imports types, effect (runtime), coeffect (runtime), lifecycle (runtime)
+loader.ts       — imports types, context (runtime), lifecycle (runtime), hmr (runtime, for import)
+hmr.ts          — imports types, context (runtime), loader (runtime), lifecycle (runtime)
+index.ts        — re-exports all of the above
+```
+
+Check for runtime cycles:
+- `context → lifecycle → fiber → (nothing runtime)` and `fiber → context` is type-only, so `context → lifecycle → fiber` has no cycle back to `context`.
+- `context → coeffect → lifecycle → effect/fiber`; no runtime edge back to `context` (coeffect imports context type-only).
+- `loader → hmr → loader` **is a runtime cycle** if both import each other's class at runtime. The task says `loader.ts` depends on `./hmr` "for module import" and `hmr.ts` depends on `./loader` (for `LoadedEntry` type and stale entries). Resolution: `hmr.ts` imports `Loader` type-only (`import type { LoadedEntry }`) and operates on `LoadedEntry` objects passed in; the loader imports `import()` from Node, not `HMR`. If the loader needs `HMR`, it should receive it by injection or import it lazily inside a method. I recommend: `loader.ts` does **not** import `hmr.ts` at runtime; it uses Node's dynamic `import()` directly, and `HMR` receives a list of `LoadedEntry` from the caller. This keeps the graph acyclic.
+
+**Key circular-import fixes:**
+
+- `fiber.ts` must not import `lifecycle.ts` at runtime. `Fiber.markRetired()` needs `refresh`. Solution: `Lifecycle.use` injects a private `refreshFn` closure into the Fiber at construction (`fiber._refresh = () => refresh(fiber)`). This is an implementation detail not in the design's public interface, but it is necessary to break the cycle.
+- `coeffect.ts` imports `Lifecycle.refresh` at runtime; `lifecycle.ts` does not import `coeffect.ts`, so this is one-way.
+- `context.ts` imports `effect`, `coeffect`, `lifecycle` at runtime; none of those import `context.ts` at runtime.
+
+---
+
+## 3. Type-Level Foundations (`src/types.ts`)
+
+`types.ts` defines the formal model's executable vocabulary:
+
+| Paper concept | Task type |
+|---|---|
+| `𝔈iterΓ` producer | `EffectCallback` |
+| inverse / accumulator function | `Dispose` / `Inverse` |
+| target view `⊥` | `null` |
+| lifecycle `ΘΓ` | `LifecycleState` discriminated by string |
+| component `(d, p, e)` | `Component { inject, provide, apply }` |
+| configuration entry | `Entry` |
+| fiber + entry state | `LoadedEntry` |
+| HMR result | `Classification` |
+| loader diff item | `Change` |
+
+**Critical logical clarification — the `EffectCallback` protocol and `Component.apply`.**
+
+The paper's effect iterator is `𝔈iterΓ = μℑ. Γ → Γ × (Γ → Γ) × Maybe(ℑ)`. In the implementation, each `yield` of an async generator is one iteration; the yielded value is an inverse; the generator's `done` flag is `Nothing`; a continuation is "the generator continues".
+
+The design's `EffectCallback = () => AsyncGenerator<Inverse, void, unknown> | (() => Inverse | void)` is ambiguous in the context of `Component.apply(ctx, config): EffectCallback | Dispose`. After careful tracing, the only protocol that is consistent with `execute` calling the callback **once** is:
+
+1. `Component.apply(ctx, config)` **must return an `EffectCallback`** — a function whose body performs the component's setup and returns either an async generator (multi-step) or the inverse function (single-step). The `| Dispose` branch of the declared type is realized by the single-step `EffectCallback` shape; a raw `Dispose` returned directly from `Component.apply` is rejected by convention because calling it at load time would prematurely run the inverse (there is no runtime way to safely distinguish a `Dispose` from an `EffectCallback`, since both are 0-ary functions).
+2. `fiber.apply` must be bound as:
+   ```ts
+   fiber.apply = () => component.apply(fiber.ctx, config)();
+   ```
+   That is, `Lifecycle.use` calls `component.apply` (obtaining the EffectCallback) and immediately calls that EffectCallback (performing setup / creating the generator). The result is `AsyncGenerator | Inverse`, which matches what `execute` expects from its callback.
+
+Concretely:
+- Single-step component effect:
+  ```ts
+  apply(ctx, config) {
+    return () => {
+      ctx.set('x', 1);                    // setup runs when this EffectCallback is called
+      return () => { /* inverse of setup */ };
+    };
+  }
+  ```
+- Multi-step (iterator) component effect:
+  ```ts
+  apply(ctx, config) {
+    return () => (async function* () {
+      const d1 = ctx.set('x', 1);         // setup runs on first iteration
+      yield d1;
+      const d2 = ctx.set('y', 2);
+      yield d2;
+    })();
+  }
+  ```
+
+`execute` normalizes the callback result: if it has a `next` method → iterate; if it is a function → treat it as the inverse (it is already the inverse because `fiber.apply` unwrapped the EffectCallback). If the result is `undefined` → no-op.
+
+---
+
+## 4. Revertible Effects (`src/effect.ts`)
+
+### 4.1 The LIFO composition and a correction to the pseudocode
+
+The paper's twisted composition (Definition 1) and iterator accumulation (Definition 52) require **the most recently yielded inverse to run first** (LIFO), because each inverse is applied at the state its own effect produced (Theorem 16). Mathematically the accumulator is `g1 ∘ g2 ∘ ⋯ ∘ gn` where the rightmost (newest) runs first.
+
+Algorithm 1 in the paper writes `inverse ← value ∘ inverse` and explains `f ∘ g` as "the disposer that runs f after g". Under ordinary composition semantics this is ambiguous and, read one way, yields FIFO. The design likewise says `compose(a, b)` runs `b` before `a` and sets `inverse = value ∘ inverse`, which together are FIFO.
+
+**Decision (config: `inverseComposition: LIFO`):** define
+
+```ts
+function compose(a: Dispose, b: Dispose): Dispose {
+  return async () => { await a(); await b(); };
+}
+```
+
+so `compose(a, b)` runs `a` first, then `b`. Then:
+
+- In `execute`: `inverse = compose(value, inverse)` — the newly yielded inverse `value` runs first. **This is the corrected line; the design's `value ∘ inverse` must run `value` first, which requires `value` to be the left operand of the "runs-first" compose.**
+- In `effect`: `ctx.dispose = compose(dispose, ctx.dispose)` — the newest effect's inverse is prepended, so parent-context recovery is LIFO across all effects.
+- In `reload`: `fiber.dispose = compose(recover, fiber.dispose)` — the just-completed activation's accumulator is prepended.
+
+### 4.2 `execute(callback, guard)`
+
+```
+normalize(callback()) → AsyncGenerator | Inverse | void
+loop:
+  if !guard() break
+  ({ value, done }) = await iter.next()
+  if done break
+  if value is a function: inverse = compose(value, inverse)
+return inverse
+```
+
+Two requirements from config / paper:
+
+- `guardCheckPerIteration: true` — this realizes the `Maybe(ℑ)` continuation boundary: between any two iterations the environment can interrupt (Section 4.3.2, L-Divert).
+- **Partial-failure recovery (L-Raise, Section 4.3.4).** If `iter.next()` throws, the inverses already yielded must not be lost. `execute` catches the error, **runs the partial inverse immediately** (recovering whatever was installed before the failing iteration), then rethrows. This is the implementation of "routing a failure like every other deactivation ... the accumulator built up to the failing iteration is applied" — simplified because a LOADING fiber's bindings are invisible to dependents, so there is no need to drain dependents first.
+
+### 4.3 `effect(ctx, callback)`
+
+- `armed = true`; `task = execute(callback, () => armed)`.
+- `dispose()`:
+  - if `!armed` return (idempotent — config `disposalIsIdempotent: true`);
+  - `armed = false` (this is the guard trip that halts an in-flight iteration at the next boundary);
+  - `recover = await task`; (if the task rejected, `execute` already recovered partial effects, so catch and do not double-apply);
+  - `recover()`;
+  - `ctx.dispose = compose(dispose, ctx.dispose)`.
+
+`identity()` is a no-op disposer. This is the recursive `∂²Γ` structure: a child effect's inverse becomes an effect on the parent context.
+
+---
+
+## 5. Coeffects (`src/coeffect.ts`)
+
+### 5.1 Slots and realm resolution
+
+Per `config.yaml`, the three slots are `@@store`, `@@isolate`, `@@intercept`, kept private on `Context`.
+
+- `store: Map<Realm, any>` — **shared by reference** across a context tree. `Context.derive()` sets the child's store reference to the parent's store. This realizes "the store is the shared environment" and makes a binding installed by one fiber visible to all contexts resolving the same realm.
+- `isolate: Map<Key, Realm>` — per-context (copied on derive, so `ctx.isolate(key, realm)` does not mutate the parent). This realizes `Σiso`'s realm table `ρ`.
+- `intercept: Map<Key, Metadata>` — per-context (copied on derive), realizing `Σinter`'s context-carried metadata `ι`.
+- A separate `providerIndex: Map<Realm, Fiber>` (module-level or per-store-tree) records which fiber installed each realm's binding. This substitutes for the paper's `store[ρ(k)].fiber` in Algorithm 7 without contaminating user values with framework fields.
+
+`resolveRealm(ctx, key) = ctx.isolate.get(key) ?? key` — the default realm is the key itself, matching "a key outside dom(ρ) resolves to its own realm" (Definition 28, `R ⊇ K`).
+
+### 5.2 `get`, `set`
+
+- `get(ctx, key)`: `store.get(resolveRealm(ctx, key))`. It is a raw lookup that never throws (Section 5.1.4: "ctx.get(key) is a lookup against the store that returns the bound value or nothing and never fails"). If interception metadata exists for `key` (config: right-biased merge), and the stored value is a function (a provider `ψ : M → V`), `get` applies it to the merged metadata: `ψ(ctx.intercept.get(key))`; this realizes `get(k, μ) = σ(k)(μ ⊕ ι(k))` with the component-declared `μ` simplified to empty metadata (the paper leaves `𝔇inter`'s per-key metadata out of the design's `Component.inject: Key[]`).
+- `set(ctx, key, value)`: returns `ctx.effect(callback)`:
+  - callback body: `realm = resolveRealm(ctx, key)`; `store.set(realm, value)`; record `providerIndex.set(realm, ctx.fiber)` if `ctx.fiber` is set; `notify(ctx, [key])`; return the inverse `() => { if (providerIndex.get(realm) === ctx.fiber) providerIndex.delete(realm); store.delete(realm); notify(ctx, [key]); }`.
+  - This makes `set` an element of `𝔈*Σ` (Definition 23): an effect function whose inverse removes the binding, and both directions notify.
+
+### 5.3 `isolate` and `intercept`
+
+Both use **derived realization** (Definition 27): each returns a new context (`derive()`), with no inverse to track; discarding the derived context is the recovery.
+
+- `isolate(ctx, key, realm?)`: if no realm, create a fresh `Symbol()`; return a child context whose `isolate` map is a copy of the parent's plus `key → realm`.
+- `intercept(ctx, key, metadata)`: return a child context whose `intercept` map is a copy of the parent's plus `key → merge(old, metadata)`, where the default merge is right-biased overwrite (config: `interceptionMetadataMerge: right-biased`); per-key custom merge functions are allowed.
+
+### 5.4 `notify(ctx, keys)` — Algorithm 3
+
+For every live fiber (global registry of all fibers):
+
+1. Skip fibers whose context tree does not share the same `store` Map (i.e., different Cordis application);
+2. Skip the owner fiber `ctx.fiber` (avoid self-notification);
+3. For each changed `key`: if `key ∈ fiber.inject` **and** `resolveRealm(fiber.ctx, key) === resolveRealm(ctx, key)`, call `Lifecycle.refresh(fiber)`, add to affected, and break (one refresh per fiber per notify);
+4. Return the affected fibers (used by `unload`'s guard to await dependents).
+
+Realm-equality (rather than key-equality) is the runtime form of "a dependent sees the key from this fiber" (Section 5.1.3); two fibers that resolve the same key to different realms are unrelated.
+
+---
+
+## 6. Fiber and Lifecycle (`src/fiber.ts`, `src/lifecycle.ts`)
+
+### 6.1 The inertial state machine
+
+Config: `inertialTransitions: true`. The state machine implements Section 4.3 / Algorithm 5:
+
+```
+refresh(fiber):
+  newTarget = computeTarget(fiber)
+  if mapsEqual(newTarget, fiber.target): return
+  fiber.target = newTarget
+  if fiber.inertia: return            // transition in flight; it will chain
+  if fiber.state == FAILED: return    // L-Begin requires INACTIVE(⊥); no re-entry (config failedFiberTarget: null)
+  if fiber.state == INACTIVE and newTarget != null:
+      state = LOADING; inertia = schedule(reload)
+  else if fiber.state == ACTIVE:       // any target change from ACTIVE, including replacement
+      state = UNLOADING; inertia = schedule(unload)
+  // LOADING/UNLOADING: no new transition (inertial)
+```
+
+**Correction to the design's refresh snippet.** The design says "if target ≠ ⊥ then LOADING/reload"; that would wrongly start a direct `reload` from `ACTIVE` when a provider is replaced, leaving the old effects installed and double-installing new ones. The paper requires L-Leave → L-Unload → L-Begin. Hence any change from `ACTIVE` (to null **or to a different non-null view**) must go through `UNLOADING`/`unload`, which chains back into `reload` if a non-null target remains. This is essential for the "replace provider" scenario in the plan.
+
+### 6.2 `computeTarget` and `resolveView`
+
+`computeTarget(fiber)` realizes Definition 46:
+
+- If `fiber.retired` → `null`.
+- For each `key ∈ fiber.inject`:
+  - `realm = resolveRealm(fiber.ctx, key)`;
+  - `provider = providerIndex.get(realm)`;
+  - if `!provider` or `provider.state !== 'ACTIVE'` or (`key ∉ provider.provide` and `key ∉ provider.writtenKeys`) → `null`;
+  - else `target.set(key, provider.uid)`.
+- Return the map.
+
+This encodes "A binding counts as available to a dependent only while the fiber that installed it is ACTIVE" and "refresh resolves each declared key against an active provider rather than against the store alone" (Section 5.1.2). Since `providerIndex` is written only by `set`, and `set`'s inverse deletes it, `computeTarget` automatically ignores bindings that are physically present but whose owner is LOADING/UNLOADING/FAILED.
+
+`resolveView(fiber)`: same loop but assumes satisfaction; used by `reload` to commit the view.
+
+`mapsEqual(a, b)`: reference equality, then null checks, then same size and same key→uid entries.
+
+### 6.3 `use` — Algorithm 4 (O-Insert primitive)
+
+```ts
+function use(ctx, component, config) {
+  const fiber = new Fiber(parentCtx: ctx, inject: component.inject, provide: component.provide);
+  fiber.ctx = ctx.derive();                    // derived child context
+  fiber.apply = () => component.apply(fiber.ctx, config)();  // see §3 resolution
+  fiber.uid = nextUid++;
+  register fiber in global registry;
+  const callback = () => {
+    refresh(fiber);
+    return () => { fiber.target = null; unload(fiber); };   // O-Retire inverse
+  };
+  EffectEngine.effect(ctx, callback);
+  return fiber;
+}
+```
+
+The callback is a plain single-inverse effect: executing it triggers the child's refresh (loading); recovering it (via the parent's `ctx.dispose`) retires the child (target = null) and unloads it. This is exactly Definition 47: the inverse is the O-Retire, not O-Remove, because O-Remove has extra premises and could fail as an inverse; O-Retire only requires the fiber to exist.
+
+### 6.4 `reload` — Algorithm 5 (L-Begin / L-Iter / L-Finish / L-Divert / L-Raise)
+
+```ts
+async function reload(fiber) {
+  const target0 = fiber.target;
+  fiber.committed = resolveView(fiber.inject);          // commit the view (L-Begin)
+  let recover, error;
+  try {
+    recover = await execute(fiber.apply, () => fiber.target === target0);
+  } catch (e) {
+    // execute already ran the partial inverse; mark failed
+    fiber.error = e; fiber.state = FAILED; fiber.target = null;
+    fiber.committed = null; fiber.inertia = null; fiber.dispose = identity();
+    return;
+  }
+  fiber.dispose = compose(recover, fiber.dispose);
+  if (fiber.target === target0) {                       // view stable (Theorem 64)
+    fiber.state = ACTIVE;
+    notify(fiber.ctx, providedKeys(fiber));             // dependents may now activate
+    fiber.inertia = null;
+  } else {                                              // target changed mid-load
+    fiber.state = UNLOADING;
+    fiber.inertia = schedule(unload(fiber));            // L-Divert → chain
+  }
+}
+```
+
+Invariants:
+- The guard is a **reference** equality on `fiber.target`. Because `refresh` only replaces `fiber.target` when `mapsEqual` fails, an unchanged view keeps the same object identity; a changed view is a fresh object. Thus `fiber.target === target0` is a correct digest comparison (Section 5.1.3: "a hash of it in fiber.target").
+- `fiber.committed` is fixed for the entire activation episode (Lemma 54(2); Theorem 64). It is written only here and discarded only at the end of `unload`.
+- On failure, `execute` has already recovered the partial effects, so `fiber.dispose` is reset to identity rather than being run again.
+
+### 6.5 `unload` — Algorithm 5 (L-Leave / L-Unload / guard)
+
+```ts
+async function unload(fiber) {
+  const dependents = notify(fiber.ctx, providedKeys(fiber));   // L-Leave effect: dependents see provider as gone
+  await Promise.all(dependents.map(d => d.awaitQuiescence())); // guard on L-Unload (Definition 50)
+  await fiber.dispose();                                       // run the accumulator
+  fiber.dispose = identity();
+  fiber.committed = null;
+  if (fiber.target === null) { fiber.state = INACTIVE; fiber.inertia = null; }
+  else { fiber.state = LOADING; fiber.inertia = schedule(reload(fiber)); }  // chain
+}
+```
+
+Key points:
+- The state was already set to `UNLOADING` by `refresh` **before** this task was scheduled. That is the L-Leave step: "the fiber stops providing, and the dependents recompute against that before any of its inverses is scheduled." `computeTarget` ignores a non-ACTIVE owner, so dependents' targets turn null immediately even though the store still holds the binding.
+- `awaitQuiescence()` resolves when the dependent reaches `INACTIVE` or `FAILED`. This is conservative: a dependent that chains into a reload against a *new* provider keeps the old provider waiting until the chain finishes. This is allowed by the metatheory (the guard is per-binding: once the dependent discards its committed view it no longer names the old provider), and it cannot deadlock when ≺ is acyclic (Theorem 66).
+- `fiber.dispose()` runs all inverses LIFO. Since a fiber's own dispose is composed only from its own effects (and the instantiation effect lives on the parent context), this reverts exactly the fiber's contribution (Corollary 62).
+
+### 6.6 `Fiber.awaitQuiescence()` and `markRetired()`
+
+- `awaitQuiescence()`: if state is `INACTIVE` or `FAILED`, resolve immediately; otherwise register a waiter. All terminal state transitions (`reload` failure → `FAILED`; `unload` → `INACTIVE`) flush waiters.
+- `markRetired()`: sets `retired = true` and calls the injected `_refresh()` (see §2). The loader re-enables by setting `retired = false` and calling `_refresh()` again.
+
+---
+
+## 7. Context (`src/context.ts`)
+
+`Context` is the executable `Γ∞ = μΓ. Γ × (Γ → Γ) × Σ`:
+
+- `dispose` is the accumulator `Γ → Γ` (the `φ` of `∂Γ`);
+- `store`/`isolate`/`intercept` are the `Σ` projection (with isolation and interception);
+- `parent` and `fiber` make the recursion / tree explicit.
+
+Methods:
+
+- `effect(cb)` → `EffectEngine.effect(this, cb)`.
+- `get(k)` / `set(k, v)` → `coeffect.get/set`.
+- `isolate(k, r?)` / `intercept(k, m)` → `coeffect` derived-context helpers.
+- `use(component, config?)` → `Lifecycle.use(this, component, config)`.
+- `derive()` → child context sharing `store` by reference, copying `isolate`/`intercept` maps (and delimiter tags). Used both for `fiber.ctx` and for isolation/interception.
+
+**Proxy-mediated access (Algorithm 6)** is required by the paper and the plan, though the design omits a dedicated `proxy.ts`. It is implemented as a module-level helper in `context.ts` (e.g., `resolveContextAccess(ctx, key)`):
+
+```
+fiber = ctx.fiber
+repeat:
+  if key ∈ fiber.committed: return ctx.get(key)         // authorized; read through own realm
+  if key ∈ fiber.inject: throw INACTIVE_ACCESS          // declared but not committed (not loaded)
+  if fiber == root: throw UNDECLARED_ACCESS
+  fiber = fiber.parentCtx.fiber
+```
+
+This is where the coeffect specification `d` is enforced at the point of use, distinct from the never-failing raw `ctx.get`. It can be exposed via a `Proxy` around `ctx` or as a `Context.resolve(key)` method; the analysis treats it as a minimal fidelity addition, not a change to the listed interfaces.
+
+---
+
+## 8. Loader (`src/loader.ts`)
+
+### 8.1 Reconciliation
+
+`reconcile(entries)` performs a keyed diff on `Entry.id` (config: `reconciliationKey: id`). For each `Change`:
+
+- `remove`: `oldEntry.fiber.markRetired()`, then `await oldEntry.fiber.awaitQuiescence()`, delete from `entries`.
+- `add`: `loadEntry(entry)`.
+- `update`: `applyChange(entry)`.
+
+`applyChange` dispatches on the changed field per config `fieldDispatch`:
+
+| Field | Action |
+|---|---|
+| `id`, `url` | retire old fiber, import new module, create new fiber |
+| `disabled` | true → `markRetired`; false → clear `retired`, refresh (keep entry in map) |
+| `isolate` | `patchIsolation` |
+| `intercept` | update `entry.intercept` map on the fiber's context; no reload (read at access time) |
+| `config` | `LoadedEntry.applyConfig(config)`: record config; retire the old fiber and re-create a fresh fiber with the new config (the reproduction's default "component handles by reloading" — the design leaves the decision to the component; for test fixtures a rebuild is the correct deterministic choice) |
+
+`loadEntry` applies the entry's `isolate` and `intercept` annotations by deriving a chain of child contexts from the loader's root context, then calls `ctx.use(component, config)` on the final derived context; stores `entry.fiber = fiber` and `entry.ctx = fiber.ctx`.
+
+### 8.2 Managed realms — Algorithm 7
+
+The purpose: when an entry's isolation annotation changes (e.g., local realm → global realm), the entry's own bindings must move to the new realm, and only affected dependents must be refreshed.
+
+Implementation steps (with `providerIndex` substituting for `store[...].fiber`):
+
+1. `ρ = entry.ctx.isolate`, `ρ' = newIsolation`, `Δ = { k | ρ(k) ≠ ρ'(k) }`.
+2. For each `k ∈ Δ`:
+   - write a fresh delimiter tag on the entry's ctx: `entry.ctx.delims.set(δ_k, freshTag())`; delimiters are inherited by derivation (delimiter map is copied in `derive()`), so `fiber.ctx.delims.get(δ_k)` identifies fibers derived from this entry's scope (Equation 65).
+   - `oldRealm = ρ(k)`, `newRealm = ρ'(k)`, `providerTag = providerIndex.get(oldRealm)?.ctx.delims.get(δ_k)`.
+3. Replace `entry.ctx.isolate` with `ρ'`.
+4. Call `Lifecycle.refresh(entry.fiber)` (the paper writes `reload(entry.fiber)`; `refresh` is the correct re-evaluation entry point).
+5. For each `k ∈ Δ`:
+   - if `providerTag === entryTag` (the binding belongs to this entry's scope) and store still has `oldRealm` and does not have `newRealm`: move the binding (`store.set(newRealm, store.get(oldRealm)); store.delete(oldRealm)`), and move the provider index entry.
+   - define `affected(fiber, k) = fiber.ctx.isolate.get(k) ∈ {oldRealm, newRealm} && (fiber.ctx.delims.get(δ_k) === entryTag) !== (providerTag === entryTag)`.
+   - call a realm-aware notify: refresh each fiber for which `affected` is true (in place of Algorithm 3's realm-equality test).
+
+The predicate's logic: if the provider is "inside" the entry's scope, then dependents "outside" the scope either gain or lose the binding as it moves realms; if the provider is outside, dependents inside the scope are the ones affected. The membership test restricts to fibers that actually resolve `k` to one of the two realms involved.
+
+---
+
+## 9. Hot Module Replacement (`src/hmr.ts`)
+
+### 9.1 Classification — Algorithm 8
+
+```
+classify(stashed, externals):
+  accepted = stashed
+  declined = externals
+  pending = ⋃ getImports(url) for url in stashed, minus accepted/declined
+  repeat until no progress:
+    for url in pending:
+      if getImports(url) ∩ accepted ≠ ∅: accepted += {url}
+      else if getImports(url) ⊆ declined: declined += {url}
+      else: pending += getImports(url) − (accepted ∪ declined)
+  declined += pending            // cycles default to declined (config: cycleDefault: declined)
+  return (accepted, declined)
+```
+
+Logic: modules that depend on a changed module must be reloaded (accept); modules whose entire dependency closure is non-reloadable must force a full restart (decline). The expansion of `pending` with unseen imports guarantees that any module transitively importing an accepted module is itself accepted, which is what makes the single-pass `detectStale` complete (see below).
+
+### 9.2 Stale detection — Algorithm 9
+
+`getDependencies(root, declined)` performs DFS through `getImports`, not crossing any declined module (declined is treated as a stable boundary).
+
+`detectStale(entries, accepted, declined)`:
+- for each entry: `tree = getDependencies(entry.url, declined)`; if `tree ∩ accepted ≠ ∅`, then fold `tree` into `accepted` and mark the entry stale.
+
+Single-pass is sufficient **only because** classification already propagated acceptance transitively upward through the import graph: if entry A's dependency tree intersects accepted at some module M, then A's own entry URL is also accepted, so A's tree (which includes its URL) intersects accepted and A is marked. This argument relies on `getImports` being complete (static imports only; dynamic imports are outside the reproduction scope, per the design's "Anything UNCLEAR").
+
+### 9.3 Transactional reload — Algorithm 10
+
+```ts
+async reload(ctx, accepted, staleEntries) {
+  backup = invalidateCaches(accepted);        // collect require.cache entries, then delete them
+  try {
+    for entry of staleEntries:
+      await retireAndRebuild(entry, () => import(entry.url));
+  } catch (error) {
+    restoreCaches(backup);
+    for entry of staleEntries:
+      await retireAndRebuild(entry, () => backup[entry.url]);
+    throw error;
+  }
+}
+```
+
+`retireAndRebuild(entry, importer)`:
+1. `entry.fiber.markRetired()`; `await entry.fiber.awaitQuiescence()` (not `fiber.dispose()` — the accumulator alone does not retire the instantiation or reset the lifecycle state);
+2. `entry.fiber = entry.ctx.use(componentFrom(await importer()), entry.config)`.
+
+This guarantees the system never rests in a half-reloaded state; on failure, caches are restored and all stale entries are rebuilt from their backup modules.
+
+---
+
+## 10. Property-Based Test Logic
+
+### Shared test harness
+
+- A `TestContext` with controllable scheduling: because the lifecycle is driven by promises and `await`, tests can operate with real microtasks, but for deterministic `confluence` tests we expose a small scheduler queue (a config-driven `schedule(task)` that the lifecycle uses; in tests it can be `setImmediate`/`queueMicrotask`, in production it's a no-op for eager promise scheduling).
+- An observable state extractor: `observableState(ctx)` returns the store's key→value pairs (deep-cloned), which is the test-side `≃` (observational equivalence; Definition 33) using deep equality plus optional per-key equivalence hooks.
+
+### The six properties (config `tests.properties`)
+
+1. **recovery_exactness** (Theorem 61 / Corollary 62): generate a random component A with several `ctx.set` effects; load A and random other fibers; interleave random operations; unload A; assert `observableState` equals the state produced by applying the other fibers' effects alone.
+2. **activation_ordering** (Theorem 63(1)): generate acyclic provider/dependent graphs; after every quiescent point, assert no ACTIVE fiber has an injected key whose provider (per its committed view) is not ACTIVE.
+3. **withdrawal_ordering** (Theorem 63(2)-(3)): instrument provider disposers; under random retire orders, assert a provider's inverse is never invoked while any ACTIVE dependent's committed view names it.
+4. **resolution_coherence** (Theorem 64): during a fiber's LOADING episode, assert `fiber.committed` is assigned exactly once and every iteration's guard evaluated `fiber.target === committed-equivalent`; on diversions, assert the fiber routes through UNLOADING.
+5. **progress** (Theorem 66): from any finite non-quiescent state with acyclic ≺, assert that driving `refresh` on some fiber produces a lifecycle step (or the system is already quiescent within a bounded number of steps).
+6. **confluence** (Theorem 73): run two random schedules of the same orchestration operations (different retire/replace orders); assert the final quiescent observable states are equivalent and the ACTIVE fiber sets match up to UID renaming.
+
+### Synthetic fixture ecosystem (config `tests.syntheticFixturePlugins`)
+
+`main.ts` and `tests/core.test.ts` use:
+- `databaseProvider` — provides `db`;
+- `logger` — provides `logger`;
+- `adapter` — provides `adapter`, injects `db`, `logger`;
+- `command` — injects `adapter`, `db`, `logger`;
+- `adminConsole` — injects `adapter`, `db`, provides `admin`.
+
+These exercise startup ordering, replacement, cascaded unload (disable `adapter` → `command` and `adminConsole` unload first), and HMR.
+
+---
+
+## 11. `src/index.ts` — Public API Barrel
+
+`src/index.ts` is the only file with no logic: it is a pure re-export barrel. Its content is:
+
+```ts
+// Public API barrel for the Cordis reproduction.
+// No logic: only re-exports of the framework surface.
+
+export { Context } from './context';
+export { Fiber } from './fiber';
+export { Lifecycle } from './lifecycle';
+export { EffectEngine } from './effect';
+export { Loader } from './loader';
+export { HMR } from './hmr';
+export * from './types';
+```
+
+Rationale and logic analysis for this exact shape:
+
+- **Why these six values?** They are the runtime counterparts of the paper's Table 2:
+  - `Context` — `Γ∞`, the first-class context;
+  - `Fiber` — the component instantiation (Definition 44);
+  - `Lifecycle` — the Section 4.3 state machine (Algorithms 4–5);
+  - `EffectEngine` — revertible effect tracking (Algorithm 1, `effectΓ`/`effectiterΓ`);
+  - `Loader` — declarative configuration reconciliation (Section 5.2, Algorithm 7);
+  - `HMR` — hot module replacement (Section 5.2.2, Algorithms 8–10).
+- **Why `export * from './types'`?** The task requires all types to be public (`Key`, `Realm`, `Dispose`, `Inverse`, `EffectCallback`, `LifecycleState`, `Component`, `Entry`, `LoadedEntry`, `Classification`, `Change`). `export *` re-exports both interfaces and type aliases; with `isolatedModules`/`verbatimModuleSyntax` one might prefer `export type *`, but the task says "all types", and `export *` is the direct realization.
+- **Ordering:** re-export order is irrelevant to evaluation (ES module exports are hoisted), but listing core primitives first (`Context`, `Fiber`, `Lifecycle`, `EffectEngine`) and higher-level tiers after (`Loader`, `HMR`) mirrors the paper's three-tier architecture (core, loader, HMR) and aids readers.
+- **No logic:** the file must not instantiate anything, run any lifecycle, or establish a root context. Any module-evaluation side effect in the barrel would break tree-shaking and test isolation, and would violate the design's "No logic; only re-exports."
+- **Circularity safety:** because `context.ts`, `loader.ts`, and `hmr.ts` have runtime imports among themselves, but the barrel only re-exports (it does not *import-and-use*), the barrel introduces no additional edges. Consumers importing from `src/index` get the full graph loaded in dependency order without cycles (see §2 for the injected `_refresh` trick and type-only imports that keep the graph acyclic).
+- **What is intentionally *not* exported:** `coeffect.ts`'s helper functions and `context.ts`'s internal `resolveContextAccess` helper are implementation details; exposing them would widen the API beyond the task's specification. Tests and `main.ts` use only the barrel.
+
+---
+
+## 12. Config Alignment Summary
+
+| config.yaml key | Where realized |
+|---|---|
+| `core.effectTracking.executionModel: async-generator` | `EffectEngine.execute` drives `AsyncGenerator`; plain effects are normalized to single-yield generators |
+| `core.effectTracking.inverseComposition: LIFO` | `compose(a, b)` runs `a` first; `execute` uses `compose(value, inverse)`; `effect` prepends to `ctx.dispose` |
+| `core.effectTracking.armedGuard: true` / `disposalIsIdempotent: true` | `armed` flag; second `dispose()` is a no-op |
+| `core.coeffect.satisfactionPredicate: all-declared-keys-present` | `computeTarget` returns `null` unless every injected key resolves to an ACTIVE provider |
+| `core.coeffect.notificationTrigger: set-and-remove` | `set`'s callback and inverse both call `notify` |
+| `core.coeffect.isolationRealms: true` | `isolate` per-context realm table; `resolveRealm` |
+| `core.coeffect.interceptionMetadataMerge: right-biased` | `intercept` default merge overwrites with new metadata |
+| `core.lifecycle.states`, `inertialTransitions`, `committedViewFixity`, `withdrawalGuard`, `failedFiberTarget` | `LifecycleState`; `refresh`/`inertia`; `committed` written only in `reload`, discarded at end of `unload`; `unload` drains dependents; failure sets `target = null` |
+| `loader.reconciliationKey: id`, `fieldDispatch` | `diffEntries`/`applyChange` |
+| `loader.managedRealms.delimiterPerKey` | Algorithm 7 delimiter tags |
+| `hmr.*` | `classify`/`detectStale`/`reload` with fixed-point rules and transactional backup/restore |
+| `tests.properties` | The six `fast-check` properties in `tests/property.test.ts` |
+
+---
+
+## 13. Implementation Order / Deliverable Readiness
+
+The recommended coding order follows the dependency graph: `types` → `effect` → `fiber` → `lifecycle` → `context` → `coeffect` → `loader` → `hmr` → `index` → `main` → tests. The barrel `src/index.ts` can be written last, once the six exports exist, and requires no further analysis: it is the fixed six re-exports plus `export * from './types'`.
+
+The analysis above resolves the non-obvious points that would otherwise cause the reproduction to diverge from the paper:
+1. LIFO composition direction (newest inverse runs first);
+2. the `Component.apply` → `fiber.apply` unwrapping protocol;
+3. `refresh` from `ACTIVE` must unload before reloading on provider replacement;
+4. `execute` must recover partial inverses before rethrowing (L-Raise);
+5. `providedKeys` = declared `provide` ∪ runtime-written keys;
+6. provider discovery via a `providerIndex` keyed by realm, with an ACTIVE-state check;
+7. runtime-cycle-free module graph via injected `_refresh` and type-only imports;
+8. HMR stale-detection completeness relies on classification's transitive acceptance;
+9. loader/HMR fiber replacement must retire (O-Retire) and await quiescence, not merely call the accumulator.
+
+With these settled, every module re-exported from `src/index.ts` can be implemented directly and validated against the paper's invariants.

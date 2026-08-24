@@ -1,0 +1,3 @@
+## v0.1.1-rc.2
+
+**Image & Files pipeline, vision model, OAuth-ready credentials.** The attachment stack gains a normalized image and Files API pipeline [PR #2676](https://github.com/deepseek-ai/deepseek-harness/pull/2676), the DeepSeek vision model enters the model catalog [PR #2726](https://github.com/deepseek-ai/deepseek-harness/pull/2726), and credentials abstract into a service with OAuth login [PR #2509](https://github.com/deepseek-ai/deepseek-harness/pull/2509). The web UI sizes wide markdown tables by column count, accepts multiline ask_user_question answers, and hardens the bubblewrap sandbox against procfs root escapes. [Full changelog](https://github.com/deepseek-ai/deepseek-harness/compare/master@{3day}...master)

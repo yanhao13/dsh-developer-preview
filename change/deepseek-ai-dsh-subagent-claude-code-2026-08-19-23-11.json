@@ -1,0 +1,6 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-subagent-claude-code): rethrow accumulated cleanup errors; register fresh handle",
+  "packageName": "@deepseek-ai/dsh-subagent-claude-code",
+  "email": "cc.yu@deepseek.com"
+}

@@ -1,0 +1,7 @@
+{
+  "type": "minor",
+  "comment": "feat(dsh-web): refine subagent header switcher",
+  "packageName": "@deepseek-ai/dsh-web",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}

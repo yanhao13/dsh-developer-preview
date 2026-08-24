@@ -1,0 +1,410 @@
+# Logic Analysis for `src/types.ts`
+
+## 1. Role and Constraints of `src/types.ts`
+
+`src/types.ts` is the shared type contract for the entire Cordis reproduction. It must satisfy three constraints:
+
+- **Zero project imports**: The file cannot import from `./context`, `./fiber`, or any other project module. This prevents circular type dependencies. All other modules are expected to import shared types from `./types`.
+- **Full cross-module type support**: Because `Component.apply(ctx, config)` and `LoadedEntry.fiber: Fiber | null` reference `Context` and `Fiber`, this file must also provide structural types for `Context` and `Fiber`. Otherwise the `no imports` constraint cannot be satisfied.
+- **Paper alignment**: Every type should be traceable to a formal construct in the paper: effect/coeffect contexts, components/fibers, loader entries, HMR classification, and reconciliation changes.
+
+The file is **type-only**: it contains no runtime logic, no classes, and no executable statements. It may contain interfaces, type aliases, and documentation comments.
+
+---
+
+## 2. The `Context` / `Fiber` Type Problem
+
+The task’s export list does not explicitly include `Context` or `Fiber`, yet they are needed by `Component` and `LoadedEntry`. Two clean ways to resolve this in `src/types.ts`:
+
+1. **Declare and export structural interfaces** `Context` and `Fiber` in `types.ts`.
+2. **Declare them as non-exported interfaces**; but then exported types referencing them can generate declaration errors and are awkward for consumers.
+
+**Recommendation:** export `Context` and `Fiber` interfaces from `types.ts`. The implementation classes in `context.ts` and `fiber.ts` will implement these interfaces structurally. To avoid name collisions in `index.ts`, export the runtime class from `./context` (e.g., `export { Context } from './context'`) and export the pure type interfaces from `./types` under aliases if necessary.
+
+The `Context` interface must expose the public methods used by components, lifecycle, loader, and HMR:
+
+- `parent`, `fiber`, `dispose`
+- `effect(callback)`, `get(key)`, `set(key, value)`
+- `isolate(key, realm?)`, `intercept(key, metadata)`
+- `use(component, config?)`, `derive()`
+
+The `Fiber` interface must expose the lifecycle fields used by `refresh`, `reload`, `unload`, `notify`, and loader/HMR:
+
+- `uid`, `parentCtx`, `ctx`
+- `inject`, `provide`, `apply`
+- `state`, `target`, `committed`, `dispose`, `inertia`, `retired`, `error`
+- `refresh()`, `awaitQuiescence()`, `markRetired()`
+
+These interfaces should be treated as **structural contracts**, not as complete class implementations.
+
+---
+
+## 3. Type-by-Type Analysis
+
+### 3.1 `type Key = string | symbol`
+
+Maps to the key space `K` of the coeffect context (Definition 22).
+
+- Strings are used for user-facing dependency names (e.g., `'db'`, `'logger'`).
+- Symbols are used for framework-internal keys and for avoiding key collisions between independent providers.
+- Equality is `===`, which works for both strings and symbols.
+- `Key` appears in `inject`, `provide`, isolation maps, interception metadata, and target/committed views.
+
+**Invariant:** a fiber’s `inject` and `provide` arrays should not contain duplicate keys.
+
+---
+
+### 3.2 `type Realm = symbol | string`
+
+Maps to the realm identifiers `R` of the isolation context (Definition 28), where `R ⊇ K`.
+
+- A string realm is used for user-named global realms from the loader’s `isolate: "string"` configuration.
+- A symbol realm is used for auto-generated local realms from `isolate: true` or from `ctx.isolate(key)` without an explicit realm.
+- The default realm of a key is the key itself.
+
+**Important collision warning:** because `R ⊇ K`, a string key and a string realm can share the same name. The implementation should ensure generated realms are symbols and that user-provided string realms are treated as a separate namespace only by convention. This cannot be enforced by TypeScript alone.
+
+---
+
+### 3.3 `type Metadata = unknown`
+
+Maps to the per-key metadata type `ℳ_k` in the interception model (Definition 30).
+
+- `unknown` is intentionally permissive because each key may define its own metadata type.
+- The paper requires a per-key monoid `(ℳ_k, ⊕_k, ε_k)`. TypeScript cannot express this generically without higher-kinded machinery, so runtime merge functions are needed.
+- The default merge, per config.yaml, is **right-biased overwrite**.
+
+**Recommendation:** the `Context.intercept` method should accept an optional merge function, or the provider of a key should register a merge function; otherwise the default overwrite is used.
+
+---
+
+### 3.4 `type Dispose = () => void | Promise<void>`
+
+Represents an inverse function `g : Γ → Γ` in runtime form.
+
+- Calling a `Dispose` reverts one tracked effect.
+- It may be synchronous or asynchronous.
+- The formal model requires the inverse to satisfy `g(δ) = γ` up to observational equivalence (Definition 37), but the type cannot enforce this.
+
+**Invariant:** disposal should be idempotent (config.yaml: `disposalIsIdempotent: true`). The effect engine must guard against double disposal.
+
+---
+
+### 3.5 `type Inverse = Dispose`
+
+Alias for readability and paper alignment (`𝔈*Γ` returns an inverse).
+
+Using `Inverse` in `EffectCallback` and generator yields makes the code self-documenting.
+
+---
+
+### 3.6 `type Guard = () => boolean`
+
+The guard is consulted by `EffectEngine.execute` before each iteration step (Algorithm 1).
+
+- In `ctx.effect`, the guard checks the `armed` flag.
+- In `reload`, the guard checks `fiber.target === target0` (Algorithm 5).
+- Guards are synchronous and side-effect-free in the formal model.
+
+---
+
+### 3.7 `type EffectCallback = () => AsyncGenerator<Inverse, void, unknown> | (() => Inverse | void)`
+
+This is the most semantically subtle type. It represents the runtime form of `𝔈iter Γ` and `𝔈Γ`.
+
+Due to TypeScript precedence, this reads as:
+
+```ts
+type EffectCallback = () =>
+  | AsyncGenerator<Inverse, void, unknown>
+  | (() => Inverse | void);
+```
+
+That is, calling an `EffectCallback` returns either:
+
+1. an **async generator** that yields inverses one at a time; or
+2. a **function** that itself represents the one-shot inverse (the plain effect form).
+
+The second alternative is a function whose return type is `Inverse | void`. A typical one-shot effect callback such as:
+
+```ts
+() => {
+  installTheEffect();
+  return () => uninstallTheEffect();
+}
+```
+
+returns a function `() => void`, which is assignable to `Inverse` and therefore to `Inverse | void`.
+
+**Critical ambiguity:** a `Dispose` is also a function. Because `EffectCallback` can return a function, and `Component.apply` may return either `EffectCallback | Dispose`, the runtime cannot always distinguish “a function that performs the effect and returns an inverse” from “an inverse itself” by `typeof` alone. The `EffectEngine.execute` implementation must define a clear convention:
+
+- **Convention for this reproduction:** `EffectCallback` is the sole input to `execute`. The return value of calling the callback is either an `AsyncGenerator` or a *direct inverse* — never another callback that must be invoked again.
+- Therefore `Component.apply` must be normalized by `Lifecycle.use` so that `fiber.apply` is a valid `EffectCallback`. A raw `Dispose` returned by `Component.apply` will be wrapped as `() => dispose`, while a returned `EffectCallback` will be invoked to obtain the iterator/inverse. This normalization is internal and does not change the public types.
+
+---
+
+### 3.8 `type LifecycleState = 'INACTIVE' | 'LOADING' | 'ACTIVE' | 'UNLOADING' | 'FAILED'`
+
+Maps to Section 4.3 lifecycle states:
+
+| Paper state | Implementation state |
+|---|---|
+| `Inactive(⊥)` | `INACTIVE` |
+| `Reloading(i, g, ω)` | `LOADING` |
+| `Active(g, ω)` | `ACTIVE` |
+| `Unloading(g, ω, ζ)` | `UNLOADING` |
+| `Inactive(ξ)` with error outcome | `FAILED` |
+
+`FAILED` is not a separate formal state; it is an error outcome carried by `Inactive`. Keeping it explicit simplifies error inspection.
+
+**State invariants:**
+
+- `INACTIVE`: `target` may be non-null (if dependencies exist) or null (if retired/unsatisfied); `committed` is null; `dispose` is the identity.
+- `LOADING`: `committed` is non-null; `dispose` accumulates inverses as the effect iterator runs; `inertia` is non-null.
+- `ACTIVE`: `committed` is non-null and must equal `target` (under the paper’s fixity); `dispose` is the full accumulator; `inertia` is null.
+- `UNLOADING`: `committed` remains non-null until after `dispose` runs; `inertia` is non-null; dependents are drained before disposal.
+- `FAILED`: `target` is null; `committed` is null; `dispose` is identity, because the failed activation was fully recovered.
+
+---
+
+### 3.9 `interface Component`
+
+Maps to Definition 43: a component is a triple `(d, p, e)`.
+
+```ts
+interface Component {
+  inject: Key[];      // d: declared dependencies (coeffect specification)
+  provide: Key[];     // p: declared provisions
+  apply(ctx: Context, config: any): EffectCallback | Dispose; // e: witnessed effect
+}
+```
+
+- `inject` is `d`: the set of dependency keys the component requires from the environment.
+- `provide` is `p`: the set of keys the component may install in the coeffect store.
+- `apply` is the effect function `e`; it receives the fiber’s derived context and the configuration payload.
+
+**Ambiguity in `apply` return type:** as noted above, `EffectCallback | Dispose` mixes two function-like concepts. The implementation should normalize this in `Lifecycle.use`:
+
+- If `Component.apply` returns an `AsyncGenerator`, use it directly.
+- If it returns a function that is a `Dispose` (i.e., the inverse), wrap it as a one-shot `EffectCallback`.
+- If it returns an `EffectCallback`, invoke it to obtain the actual generator/inverse.
+
+This normalization is required so that `fiber.apply` is always an `EffectCallback` and `EffectEngine.execute` behaves according to Algorithm 1.
+
+---
+
+### 3.10 `interface Entry`
+
+Maps to Definition 74 and the loader configuration tree.
+
+```ts
+interface Entry {
+  id: string;
+  url: string;
+  config?: any;
+  disabled?: boolean;
+  isolate?: boolean | string;
+  intercept?: Record<string, Metadata>;
+  children?: Entry[];
+}
+```
+
+- `id`: stable reconciliation key (`loader.reconciliationKey: id`).
+- `url`: module URL of the component to load.
+- `config`: passed to the component’s `apply`.
+- `disabled`: maps to the retirement flag `τ` in Definition 44.
+- `isolate`: `true` requests a local realm tagged by the entry id; a string requests a global realm shared by all entries naming that string; `false`/`undefined` means no special isolation.
+- `intercept`: metadata applied to the entry’s derived context.
+- `children`: nested entries for `@cordisjs/group` and `@cordisjs/include`.
+
+---
+
+### 3.11 `interface LoadedEntry`
+
+Represents the runtime state of a configuration entry.
+
+```ts
+interface LoadedEntry {
+  id: string;
+  url: string;
+  config: any;
+  disabled: boolean;
+  fiber: Fiber | null;
+  isolate: Map<Key, Realm>;
+  intercept: Map<Key, Metadata>;
+  applyConfig(config: any): Promise<void>;
+}
+```
+
+- `fiber` is `null` while the entry is disabled or before it has been instantiated.
+- `isolate` and `intercept` are the active annotations applied to the fiber’s context. They may diverge from the last committed `Entry` values while a reconciliation is in progress.
+- `applyConfig` handles config changes; the component decides whether a reload is necessary.
+
+---
+
+### 3.12 `interface Classification`
+
+Maps to the HMR Phase 1 output (Algorithm 8).
+
+```ts
+interface Classification {
+  accepted: Set<string>;
+  declined: Set<string>;
+}
+```
+
+- `accepted`: modules that can be hot-replaced.
+- `declined`: modules that cannot be hot-replaced and trigger a full restart.
+- The two sets must be disjoint.
+- `detectStale` may grow `accepted` by folding in stale dependency trees (Algorithm 9).
+
+---
+
+### 3.13 `interface Change`
+
+Represents one reconciliation operation from the keyed diff.
+
+```ts
+interface Change {
+  type: 'add' | 'remove' | 'update';
+  entry: Entry;
+  oldEntry?: LoadedEntry;
+}
+```
+
+- For `add`, `oldEntry` is absent.
+- For `remove` and `update`, `oldEntry` should be present.
+- The `type` field is the discriminated union tag, enabling exhaustive `switch` in the loader.
+- `entry` is the new desired state; in a `remove`, it is the removed entry’s last known configuration.
+
+---
+
+## 4. Additional Structural Interfaces
+
+Because `Component` and `LoadedEntry` reference `Context` and `Fiber`, `src/types.ts` should also include structural interfaces for both. They are not in the explicit export list, but they are required for the file to be self-contained.
+
+```ts
+export interface Context {
+  readonly parent: Context | null;
+  readonly fiber: Fiber | null;
+  dispose: Dispose;
+  effect(callback: EffectCallback): Dispose;
+  get(key: Key): any;
+  set(key: Key, value: any): Dispose;
+  isolate(key: Key, realm?: Realm): Context;
+  intercept(key: Key, metadata: Metadata): Context;
+  use(component: Component, config?: any): Fiber;
+  derive(): Context;
+}
+
+export interface Fiber {
+  readonly uid: number;
+  readonly parentCtx: Context;
+  readonly ctx: Context;
+  readonly inject: Key[];
+  readonly provide: Key[];
+  apply: EffectCallback;
+  state: LifecycleState;
+  target: Map<Key, number> | null;
+  committed: Map<Key, number> | null;
+  dispose: Dispose;
+  inertia: Promise<void> | null;
+  retired: boolean;
+  error: unknown | null;
+  refresh(): void;
+  awaitQuiescence(): Promise<void>;
+  markRetired(): void;
+}
+```
+
+These interfaces intentionally expose only the public surface. Private implementation details (e.g., the symbol-keyed `@@store`, `@@isolate`, `@@intercept` slots) remain private to the classes.
+
+---
+
+## 5. Cross-Cutting Invariants Captured by the Types
+
+### 5.1 Fiber UIDs and Views
+
+- `Fiber.uid` is a globally unique number, monotonically increasing.
+- `target` and `committed` are `Map<Key, number> | null`, where the number is the UID of the provider fiber.
+- `target === null` means “should not be active” (`⊥` in Definition 46).
+- `committed === null` means “no committed view” (only valid in `INACTIVE`/`FAILED`).
+- Comparing `target` by value is used to trigger lifecycle transitions. Since UIDs are never reused, a replaced provider is always detected even if the provided value is equal.
+
+### 5.2 State/Dispose Consistency
+
+- `dispose` should be the identity function when `state` is `INACTIVE` or `FAILED`.
+- `dispose` accumulates inverses during `LOADING` and is the full accumulator during `ACTIVE` and `UNLOADING`.
+- `committed` remains stable during an entire episode, matching `Lemma 54(2)`.
+
+### 5.3 Provider and Dependency Invariants
+
+- `Component.provide` should be a superset of the keys actually written by `apply`. The runtime records observed writes and uses the declared `provide` as a fallback.
+- No two active fibers may provide the same realm-resolved key (Definition 43 disjointness).
+- A fiber must not activate until every key in `inject` is provided by an `ACTIVE` fiber.
+
+---
+
+## 6. Configuration Alignment
+
+The types must support every setting in `config.yaml`:
+
+| Config key | Type support |
+|---|---|
+| `core.contextSlots.store/isolate/intercept` | Private symbol-keyed slots in `Context`; not exposed in types. |
+| `core.effectTracking.executionModel: async-generator` | `EffectCallback` gives an `AsyncGenerator<Inverse>`. |
+| `core.effectTracking.inverseComposition: LIFO` | `Dispose` composition in `EffectEngine`. |
+| `core.lifecycle.states` | `LifecycleState` exactly matches the five listed states. |
+| `loader.reconciliationKey: id` | `Entry.id` is the required stable key. |
+| `loader.fieldDispatch.isolate: patchIsolation` | `Entry.isolate: boolean or string` feeds `patchIsolation`. |
+| `hmr.classification` | `Classification.accepted/declined` maps to Algorithm 8. |
+| `hmr.reload.transactional` | `HMR.reload` uses `accepted` and `staleEntries`. |
+| `tests.syntheticFixturePlugins` | `Component` objects in tests use `inject`/`provide` for these roles. |
+
+---
+
+## 7. Open Issues and Decisions for the Implementer
+
+### 7.1 `EffectCallback` and `Component.apply` Normalization
+
+This is the single most important logic decision. The public types as listed create a runtime ambiguity because both `EffectCallback` and `Dispose` are function types.
+
+**Decision needed:** `Lifecycle.use` must normalize the result of `component.apply(fiber.ctx, config)` so that `fiber.apply` is always an `EffectCallback` that `EffectEngine.execute` can consume without double-calling. A practical approach:
+
+- If `Component.apply` returns an `AsyncGenerator`, use it as the result.
+- If it returns a task object with a `.next()` method, use it.
+- If it returns a function and that function is known to be a `Dispose` (e.g., because `Component.apply` explicitly declares a `Dispose` return), wrap it as `() => dispose`.
+- If it returns a function that is an `EffectCallback`, invoke it to obtain the generator/inverse.
+
+Since TypeScript cannot distinguish these at runtime without a marker, the implementation must choose one canonical style for components. **Recommendation:** treat `Component.apply` as returning an `EffectCallback` in all cases; a one-shot effect is written as an `EffectCallback` that performs the effect and returns a `Dispose`. Then `fiber.apply` is a thunk that calls `component.apply(...)` and then invokes the returned `EffectCallback` once to obtain the final generator/inverse. This keeps the public type `EffectCallback | Dispose` but makes the `Dispose` case a convenience that is wrapped internally.
+
+### 7.2 Exporting `Context` and `Fiber` Interfaces
+
+`index.ts` must avoid re-export collisions. The cleanest arrangement:
+
+- `context.ts` exports the runtime class `Context`.
+- `fiber.ts` exports the runtime class `Fiber`.
+- `types.ts` exports the interfaces `Context` and `Fiber`.
+- In `index.ts`, prefer the runtime classes for value/type use, and export the pure types from `types.ts` under aliases or skip the interface exports if they conflict.
+
+### 7.3 Metadata Merge Semantics
+
+`Metadata = unknown` cannot enforce the paper’s per-key monoid. The runtime must allow each key to register a merge function; otherwise interception metadata is overwritten right-biased.
+
+### 7.4 Observational Equivalence
+
+The paper’s state equivalence `≃` (Definition 33) is application-defined. The types do not represent it. Property tests should use deep equality by default and allow custom per-key equivalence hooks.
+
+---
+
+## 8. Summary
+
+`src/types.ts` is the foundational type contract of the Cordis reproduction. It must:
+
+- define all the listed exports exactly as specified;
+- additionally declare structural `Context` and `Fiber` interfaces so the module can be self-contained with zero imports;
+- capture the state machine, dependency/provision, and configuration structures from the paper;
+- highlight the `EffectCallback` / `Component.apply` ambiguity so the lifecycle implementation can normalize correctly;
+- align with `config.yaml` settings for lifecycle states, loader reconciliation, and HMR classification.
+
+With these types in place, the rest of the implementation can proceed using a single, shared vocabulary directly traceable to the paper’s formal definitions.

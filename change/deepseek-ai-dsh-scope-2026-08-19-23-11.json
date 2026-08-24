@@ -1,0 +1,7 @@
+{
+  "type": "patch",
+  "comment": "fix(dsh-scope): scope switcher and merge validation",
+  "packageName": "@deepseek-ai/dsh-scope",
+  "email": "cc.yu@deepseek.com",
+  "dependentChangeType": "patch"
+}
